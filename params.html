@@ -14,110 +14,120 @@
         </header>
 
         <div class="tabs">
-            <button class="tab active" data-tab="connection">Connection Info</button>
+            <button class="tab active" data-tab="servers">Servers</button>
             <button class="tab" data-tab="oauth">OAuth Presets</button>
-            <button class="tab" data-tab="agent">Server Config</button>
         </div>
 
-        <!-- Connection Info Tab -->
-        <div id="tab-connection" class="tab-content active">
-            <!-- Hero: endpoint + status -->
-            <div class="card hero-card">
-                <div class="hero-endpoint">
-                    <div class="hero-url-label">MCP Endpoint</div>
-                    <div class="url-box url-box-lg">
-                        <code id="mcp-url">Loading...</code>
-                        <button onclick="copyUrl()" class="btn-small">Copy</button>
-                    </div>
-                </div>
-                <div class="status-row">
-                    <div class="status-pill" id="status-agent">
-                        <span class="status-dot"></span>
-                        <span class="status-label">Agent</span>
-                    </div>
-                    <div class="status-pill" id="status-oauth">
-                        <span class="status-dot"></span>
-                        <span class="status-label">OAuth</span>
-                    </div>
-                    <div class="status-pill" id="status-preset">
-                        <span class="status-dot"></span>
-                        <span class="status-label" id="status-preset-name">Preset</span>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Setup checklist (hidden when fully configured) -->
-            <div id="setup-checklist" class="card" style="display:none;">
-                <h2>Setup Checklist</h2>
-                <div class="checklist">
-                    <div class="checklist-item" id="check-agent">
-                        <span class="check-icon"></span>
-                        <div>
-                            <strong>Configure agent tools</strong>
-                            <span class="help">Go to <em>Server Config</em> &rarr; select a project and tools to expose.</span>
-                        </div>
-                    </div>
-                    <div class="checklist-item" id="check-oauth">
-                        <span class="check-icon"></span>
-                        <div>
-                            <strong>Set up OAuth</strong>
-                            <span class="help">Create a preset on <em>OAuth Presets</em>, then activate it on <em>Server Config</em>.</span>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Client instructions -->
+        <!-- Servers Tab -->
+        <div id="tab-servers" class="tab-content active">
             <div class="card">
-                <h2>Connect a Client</h2>
-                <p class="help" style="margin-bottom:12px;">Choose your MCP client below. OAuth login is handled automatically &mdash; you'll be prompted in your browser.</p>
-                <div class="client-tabs">
-                    <button class="client-tab active" data-client="claude-desktop">Claude Desktop</button>
-                    <button class="client-tab" data-client="claude-code">Claude Code</button>
-                    <button class="client-tab" data-client="chatgpt">ChatGPT</button>
-                </div>
-
-                <div id="client-claude-desktop" class="client-panel active">
-                    <ol class="instructions">
-                        <li>Open Claude Desktop and go to <strong>Settings</strong></li>
-                        <li>Click <strong>MCP Servers</strong> &rarr; <strong>Add Remote Server</strong></li>
-                        <li>Paste the endpoint URL:
-                            <div class="url-box url-box-sm">
-                                <code id="url-claude-desktop">Loading...</code>
-                                <button onclick="copyUrl()" class="btn-small">Copy</button>
-                            </div>
-                        </li>
-                        <li>Click <strong>Add</strong> &mdash; Claude will open your browser to complete the OAuth login</li>
-                        <li>After authorizing, your Dataiku agent tools will appear in Claude's tool list</li>
-                    </ol>
-                </div>
-
-                <div id="client-claude-code" class="client-panel">
-                    <p class="instructions-intro">Run this command in your terminal:</p>
-                    <div class="url-box url-box-sm" style="margin-bottom:12px;">
-                        <code id="claude-code-cmd">Loading...</code>
-                        <button onclick="copyCmdClaudeCode()" class="btn-small">Copy</button>
+                <div class="presets-header">
+                    <div>
+                        <h2>MCP Servers</h2>
+                        <p class="help">Each server exposes its own MCP endpoint with independent tools and OAuth config.</p>
                     </div>
-                    <p class="instructions-intro">Or add to your <code>.mcp.json</code>:</p>
-                    <pre id="client-config">Loading...</pre>
-                    <p class="help" style="margin-top:8px;">Claude Code will handle the OAuth flow in your browser on first use.</p>
+                    <button onclick="openNewServer()" class="btn-small">+ New Server</button>
                 </div>
-
-                <div id="client-chatgpt" class="client-panel">
-                    <ol class="instructions">
-                        <li>In the ChatGPT admin console, go to <strong>Integrations</strong> &rarr; <strong>MCP Servers</strong></li>
-                        <li>Click <strong>Add Server</strong></li>
-                        <li>Paste the endpoint URL:
-                            <div class="url-box url-box-sm">
-                                <code id="url-chatgpt">Loading...</code>
-                                <button onclick="copyUrl()" class="btn-small">Copy</button>
-                            </div>
-                        </li>
-                        <li>ChatGPT will perform the OAuth flow and prompt you to authorize access</li>
-                        <li>Once connected, your Dataiku tools will be available in ChatGPT conversations</li>
-                    </ol>
+                <div id="servers-list">
+                    <p class="help">Loading...</p>
                 </div>
             </div>
+
+            <!-- Server Editor (hidden by default) -->
+            <div id="server-editor" class="card" style="display:none;">
+                <div class="editor-header">
+                    <h2 id="server-editor-title">New Server</h2>
+                    <button onclick="closeServerEditor()" class="btn-small">Cancel</button>
+                </div>
+
+                <div class="form-group">
+                    <label>Server Name (URL slug)</label>
+                    <input type="text" id="server-name" placeholder="e.g. analytics">
+                    <span class="help">Lowercase letters, numbers, hyphens only. Used in the endpoint URL.</span>
+                </div>
+
+                <div class="form-group">
+                    <label>Display Name</label>
+                    <input type="text" id="server-display-name" placeholder="e.g. Analytics Tools">
+                </div>
+
+                <div class="form-group">
+                    <label>OAuth Preset</label>
+                    <select id="server-preset-select">
+                        <option value="">None (no auth)</option>
+                    </select>
+                </div>
+
+                <h3 class="section-label">Agent Tools</h3>
+                <div class="form-group">
+                    <label>Project</label>
+                    <div class="input-with-button">
+                        <input type="text" id="server-agent-project" placeholder="PROJECT_KEY" list="project-keys-list">
+                        <datalist id="project-keys-list"></datalist>
+                        <button onclick="loadServerAgentTools()" class="btn-small">Load Tools</button>
+                    </div>
+                </div>
+
+                <div id="server-tools-list" class="tools-list">
+                    <p class="help">Enter a project key and click Load Tools to see available agent tools.</p>
+                </div>
+
+                <!-- Connection Info (shown after save / for existing servers) -->
+                <div id="server-connection-info" style="display:none;">
+                    <h3 class="section-label">Connection Info</h3>
+                    <div class="url-box url-box-sm" style="margin-bottom:12px;">
+                        <code id="server-mcp-url">Loading...</code>
+                        <button onclick="copyServerUrl()" class="btn-small">Copy</button>
+                    </div>
+
+                    <div class="client-tabs">
+                        <button class="client-tab active" data-client="se-claude-desktop">Claude Desktop</button>
+                        <button class="client-tab" data-client="se-claude-code">Claude Code</button>
+                        <button class="client-tab" data-client="se-chatgpt">ChatGPT</button>
+                    </div>
+
+                    <div id="client-se-claude-desktop" class="client-panel active">
+                        <ol class="instructions">
+                            <li>Open Claude Desktop &rarr; <strong>Settings</strong> &rarr; <strong>MCP Servers</strong> &rarr; <strong>Add Remote Server</strong></li>
+                            <li>Paste the endpoint URL above</li>
+                            <li>Click <strong>Add</strong> &mdash; Claude will open your browser to complete the OAuth login</li>
+                        </ol>
+                    </div>
+
+                    <div id="client-se-claude-code" class="client-panel">
+                        <p class="instructions-intro">Run this command in your terminal:</p>
+                        <div class="url-box url-box-sm" style="margin-bottom:12px;">
+                            <code id="server-claude-code-cmd">Loading...</code>
+                            <button onclick="copyServerCmd()" class="btn-small">Copy</button>
+                        </div>
+                        <p class="instructions-intro">Or add to your <code>.mcp.json</code>:</p>
+                        <pre id="server-client-config">Loading...</pre>
+                    </div>
+
+                    <div id="client-se-chatgpt" class="client-panel">
+                        <ol class="instructions">
+                            <li>In ChatGPT admin console &rarr; <strong>Integrations</strong> &rarr; <strong>MCP Servers</strong> &rarr; <strong>Add Server</strong></li>
+                            <li>Paste the endpoint URL above</li>
+                        </ol>
+                    </div>
+                </div>
+
+                <div class="editor-actions">
+                    <button onclick="saveServer()" class="btn-primary">Save Server</button>
+                    <span id="save-status-server"></span>
+                </div>
+            </div>
+        </div>
+
+            <!-- Debug Log (collapsible) -->
+            <details class="card">
+                <summary class="debug-summary"><h2 style="display:inline;">Debug Log</h2> <span class="help" style="display:inline; margin-left:8px;">Recent backend events</span></summary>
+                <div id="debug-log-controls" style="margin:12px 0 8px; display:flex; gap:8px;">
+                    <button onclick="refreshDebugLog()" class="btn-small">Refresh</button>
+                    <span id="debug-log-count" class="help" style="line-height:32px;"></span>
+                </div>
+                <pre id="debug-log-content" style="max-height:300px; overflow-y:auto; font-size:12px;">Click Refresh to load.</pre>
+            </details>
         </div>
 
         <!-- OAuth Presets Tab -->
@@ -126,7 +136,7 @@
                 <div class="presets-header">
                     <div>
                         <h2>Saved OAuth Presets</h2>
-                        <p class="help">Create and manage OAuth configurations. Activate one on the Server Config tab.</p>
+                        <p class="help">Create and manage OAuth configurations. Assign presets to servers on the Servers tab.</p>
                     </div>
                     <button onclick="openNewPreset()" class="btn-small">+ New Preset</button>
                 </div>
@@ -135,7 +145,7 @@
                 </div>
             </div>
 
-            <!-- Edit form (hidden by default) -->
+            <!-- Preset Edit form (hidden by default) -->
             <div id="preset-editor" class="card" style="display:none;">
                 <div class="editor-header">
                     <h2 id="editor-title">New Preset</h2>
@@ -247,40 +257,6 @@
                     <span id="save-status"></span>
                 </div>
             </div>
-        </div>
-
-        <!-- Server Config Tab -->
-        <div id="tab-agent" class="tab-content">
-            <div class="card">
-                <h2>Active OAuth Preset</h2>
-                <p class="help">Choose which OAuth preset protects this MCP endpoint.</p>
-                <div class="form-group">
-                    <select id="active-preset-select">
-                        <option value="">Loading...</option>
-                    </select>
-                </div>
-            </div>
-
-            <div class="card">
-                <h2>Agent Tool Selection</h2>
-                <p class="help">Select which Dataiku project and agent tools to expose via MCP.</p>
-
-                <div class="form-group">
-                    <label>Project</label>
-                    <div class="input-with-button">
-                        <input type="text" id="agent-project" placeholder="PROJECT_KEY">
-                        <button onclick="loadAgentTools()" class="btn-small">Load Tools</button>
-                    </div>
-                </div>
-
-                <div id="tools-list" class="tools-list">
-                    <p class="help">Enter a project key and click Load Tools to see available agent tools.</p>
-                </div>
-            </div>
-
-            <button onclick="saveServerConfig()" class="btn-primary">Save Configuration</button>
-            <span id="save-status-agent"></span>
-            <p class="help" style="margin-top:8px;">Changes take effect immediately &mdash; no restart needed. The server reads this config on every request.</p>
         </div>
     </div>
 </body>

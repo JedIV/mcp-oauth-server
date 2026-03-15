@@ -2,11 +2,12 @@ const backendUrl = getWebAppBackendUrl('');
 
 // State
 let currentConfig = {};
-let presetsData = {};       // key -> preset (from server)
-let editingPresetKey = '';  // key being edited, or '__new__' for new
+let presetsData = {};       // key -> preset
+let serversData = {};       // name -> server info
+let editingPresetKey = '';  // key being edited, or '__new__'
+let editingServerName = ''; // name being edited, or '__new__'
 
-// Derive the public base URL from backendUrl (which Dataiku provides correctly)
-// backendUrl looks like "/web-apps-backends/PROJECT/WEBAPP_ID/" — we need the full origin + path without trailing slash
+// Derive the public base URL
 const autoBaseUrl = window.location.origin + backendUrl.replace(/\/$/, '');
 
 // ============================================================
@@ -22,7 +23,7 @@ document.querySelectorAll('.tab').forEach(tab => {
 });
 
 // ============================================================
-// Mode switching (inside editor)
+// Mode switching (inside preset editor)
 // ============================================================
 function setOAuthMode(mode) {
     document.querySelectorAll('.mode-card').forEach(card => {
@@ -43,7 +44,7 @@ document.querySelectorAll('.mode-card').forEach(card => {
 });
 
 // ============================================================
-// Preset List (OAuth tab)
+// Helpers
 // ============================================================
 
 function slugify(name) {
@@ -52,12 +53,303 @@ function slugify(name) {
 
 const MODE_LABELS = { builtin: 'Built-in', external: 'External IdP', direct: 'Direct OAuth' };
 
+function getServerMcpUrl(serverName) {
+    return autoBaseUrl + '/servers/' + serverName + '/mcp';
+}
+
+function showSaveStatus(msg, color) {
+    ['save-status', 'save-status-server'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+            el.textContent = msg;
+            el.style.color = color;
+            setTimeout(() => { el.textContent = ''; }, 3000);
+        }
+    });
+}
+
+// ============================================================
+// Server List
+// ============================================================
+
+async function loadServers() {
+    try {
+        const resp = await fetch(backendUrl + 'admin/servers');
+        serversData = await resp.json();
+        renderServerList();
+    } catch (e) {
+        console.error('Failed to load servers:', e);
+    }
+}
+
+function renderServerList() {
+    const container = document.getElementById('servers-list');
+    const names = Object.keys(serversData);
+
+    if (names.length === 0) {
+        container.innerHTML = '<p class="help">No servers yet. Click "+ New Server" to create one.</p>';
+        return;
+    }
+
+    container.innerHTML = names.map(name => {
+        const s = serversData[name];
+        const agentBadge = s.agent_configured
+            ? '<span class="badge badge-ok">agent ready</span>'
+            : '<span class="badge badge-warn">no agent</span>';
+        const oauthBadge = s.oauth_enabled
+            ? '<span class="badge badge-mode">' + (MODE_LABELS[s.oauth_mode] || s.oauth_mode) + '</span>'
+            : '<span class="badge badge-warn">no auth</span>';
+
+        return `
+            <div class="server-row">
+                <div class="server-info">
+                    <div class="server-name">${s.display_name || name}</div>
+                    <div class="server-meta">
+                        ${agentBadge} ${oauthBadge}
+                        <span class="server-url-label">${s.mcp_url}</span>
+                    </div>
+                </div>
+                <div class="server-row-actions">
+                    <button onclick="editServer('${name}')" class="btn-small">Edit</button>
+                    <button onclick="deleteServer('${name}')" class="btn-small btn-danger">Delete</button>
+                </div>
+            </div>`;
+    }).join('');
+}
+
+// ============================================================
+// Server Editor
+// ============================================================
+
+function openNewServer() {
+    editingServerName = '__new__';
+    document.getElementById('server-editor-title').textContent = 'New Server';
+    document.getElementById('server-name').value = '';
+    document.getElementById('server-name').disabled = false;
+    document.getElementById('server-display-name').value = '';
+    document.getElementById('server-preset-select').value = '';
+    document.getElementById('server-agent-project').value = '';
+    document.getElementById('server-tools-list').innerHTML = '<p class="help">Enter a project key and click Load Tools.</p>';
+    document.getElementById('server-connection-info').style.display = 'none';
+    populateServerPresetDropdown('');
+    document.getElementById('server-editor').style.display = 'block';
+    document.getElementById('server-editor').scrollIntoView({ behavior: 'smooth' });
+}
+
+function editServer(name) {
+    const server = serversData[name];
+    if (!server) return;
+
+    editingServerName = name;
+    document.getElementById('server-editor-title').textContent = 'Edit: ' + (server.display_name || name);
+    document.getElementById('server-name').value = name;
+    document.getElementById('server-name').disabled = true; // Can't rename
+    document.getElementById('server-display-name').value = server.display_name || '';
+    document.getElementById('server-agent-project').value = (server.agent || {}).project_key || '';
+
+    populateServerPresetDropdown(server.active_preset || '');
+
+    // Show connection info
+    updateServerConnectionInfo(name);
+    document.getElementById('server-connection-info').style.display = 'block';
+
+    // Load tools if project is set
+    if ((server.agent || {}).project_key) {
+        loadServerAgentTools((server.agent || {}).tool_ids || []);
+    } else {
+        document.getElementById('server-tools-list').innerHTML = '<p class="help">Enter a project key and click Load Tools.</p>';
+    }
+
+    document.getElementById('server-editor').style.display = 'block';
+    document.getElementById('server-editor').scrollIntoView({ behavior: 'smooth' });
+}
+
+function closeServerEditor() {
+    document.getElementById('server-editor').style.display = 'none';
+    editingServerName = '';
+}
+
+function populateServerPresetDropdown(activeKey) {
+    const select = document.getElementById('server-preset-select');
+    select.innerHTML = '<option value="">None (no auth)</option>';
+    Object.keys(presetsData).forEach(key => {
+        const p = presetsData[key];
+        const opt = document.createElement('option');
+        opt.value = key;
+        opt.textContent = p.name || key;
+        select.appendChild(opt);
+    });
+    select.value = activeKey;
+}
+
+function updateServerConnectionInfo(serverName) {
+    const mcpUrl = getServerMcpUrl(serverName);
+    document.getElementById('server-mcp-url').textContent = mcpUrl;
+
+    const cmdEl = document.getElementById('server-claude-code-cmd');
+    if (cmdEl) cmdEl.textContent = 'claude mcp add dataiku-' + serverName + ' -- ' + mcpUrl;
+
+    const clientConfig = {
+        "mcpServers": {
+            ["dataiku-" + serverName]: {
+                "url": mcpUrl,
+                "type": "http"
+            }
+        }
+    };
+    const configEl = document.getElementById('server-client-config');
+    if (configEl) configEl.textContent = JSON.stringify(clientConfig, null, 2);
+}
+
+async function loadServerAgentTools(preCheckedIds) {
+    const projectKey = document.getElementById('server-agent-project').value.trim();
+    if (!projectKey) return;
+
+    const toolsList = document.getElementById('server-tools-list');
+    toolsList.innerHTML = '<p class="help">Loading...</p>';
+
+    // If called without preCheckedIds, try to get from current editing server
+    if (!preCheckedIds) {
+        if (editingServerName !== '__new__' && serversData[editingServerName]) {
+            preCheckedIds = (serversData[editingServerName].agent || {}).tool_ids || [];
+        } else {
+            preCheckedIds = [];
+        }
+    }
+
+    try {
+        const resp = await fetch(backendUrl + 'admin/agents?project_key=' + encodeURIComponent(projectKey));
+        const tools = await resp.json();
+
+        if (tools.length === 0) {
+            toolsList.innerHTML = '<p class="help">No agent tools found in this project.</p>';
+            return;
+        }
+
+        toolsList.innerHTML = tools.map(t => `
+            <div class="tool-item">
+                <input type="checkbox" id="stool-${t.tool_id}" value="${t.tool_id}"
+                    ${preCheckedIds.includes(t.tool_id) ? 'checked' : ''}>
+                <div class="tool-info">
+                    <div class="tool-name">${t.tool_name}</div>
+                    <div class="tool-type">${t.tool_type} &middot; ${t.tool_id}</div>
+                </div>
+            </div>
+        `).join('');
+    } catch (e) {
+        toolsList.innerHTML = '<p class="help">Error loading tools: ' + e.message + '</p>';
+    }
+}
+
+async function saveServer() {
+    let name;
+    if (editingServerName === '__new__') {
+        name = document.getElementById('server-name').value.trim();
+        if (!name) {
+            showSaveStatus('Server name is required', 'red');
+            return;
+        }
+        if (!/^[a-z0-9][a-z0-9_-]*$/.test(name)) {
+            showSaveStatus('Name must be lowercase letters, numbers, hyphens', 'red');
+            return;
+        }
+    } else {
+        name = editingServerName;
+    }
+
+    const serverData = {
+        display_name: document.getElementById('server-display-name').value.trim() || name,
+        active_preset: document.getElementById('server-preset-select').value,
+        agent: {
+            project_key: document.getElementById('server-agent-project').value.trim(),
+            tool_ids: Array.from(document.querySelectorAll('#server-tools-list input[type="checkbox"]:checked'))
+                .map(cb => cb.value)
+        }
+    };
+
+    try {
+        const resp = await fetch(backendUrl + 'admin/servers', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ name, server_data: serverData })
+        });
+        const result = await resp.json();
+
+        if (result.status === 'ok') {
+            showSaveStatus('Server saved!', 'green');
+            editingServerName = name;
+            document.getElementById('server-name').disabled = true;
+            updateServerConnectionInfo(name);
+            document.getElementById('server-connection-info').style.display = 'block';
+            await loadServers();
+            await refreshHealth();
+        } else {
+            showSaveStatus('Save failed: ' + (result.error || 'unknown error'), 'red');
+        }
+    } catch (e) {
+        showSaveStatus('Error: ' + e.message, 'red');
+    }
+}
+
+async function deleteServer(name) {
+    const server = serversData[name];
+    if (!confirm('Delete server "' + (server ? server.display_name : name) + '"? This removes the MCP endpoint.')) return;
+
+    try {
+        const resp = await fetch(backendUrl + 'admin/servers/' + encodeURIComponent(name), {
+            method: 'DELETE'
+        });
+        const result = await resp.json();
+
+        if (result.status === 'ok') {
+            showSaveStatus('Server deleted', 'green');
+            if (editingServerName === name) closeServerEditor();
+            await loadServers();
+            await refreshHealth();
+        } else {
+            showSaveStatus('Delete failed: ' + (result.error || 'unknown error'), 'red');
+        }
+    } catch (e) {
+        showSaveStatus('Error: ' + e.message, 'red');
+    }
+}
+
+function copyServerUrl() {
+    const url = document.getElementById('server-mcp-url').textContent.replace(/\s+/g, '');
+    navigator.clipboard.writeText(url);
+}
+
+function copyServerCmd() {
+    const cmd = document.getElementById('server-claude-code-cmd').textContent.trim();
+    navigator.clipboard.writeText(cmd);
+}
+
+// ============================================================
+// Client tab switching (within server editor connection info)
+// ============================================================
+document.addEventListener('click', (e) => {
+    const tab = e.target.closest('.client-tab');
+    if (!tab) return;
+    const parent = tab.closest('#server-connection-info');
+    if (!parent) return;
+
+    parent.querySelectorAll('.client-tab').forEach(t => t.classList.remove('active'));
+    parent.querySelectorAll('.client-panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    const panelId = 'client-' + tab.dataset.client;
+    const panel = document.getElementById(panelId);
+    if (panel) panel.classList.add('active');
+});
+
+// ============================================================
+// Preset List (OAuth tab)
+// ============================================================
+
 async function loadPresets() {
     try {
         const resp = await fetch(backendUrl + 'admin/presets');
         presetsData = await resp.json();
         renderPresetList();
-        populateActivePresetDropdown();
     } catch (e) {
         console.error('Failed to load presets:', e);
     }
@@ -75,16 +367,19 @@ function renderPresetList() {
     container.innerHTML = keys.map(key => {
         const p = presetsData[key];
         const modeLabel = MODE_LABELS[p.oauth_mode] || p.oauth_mode;
-        const activeBadge = p.is_active ? '<span class="badge badge-ok">active</span>' : '';
+        const activeServers = (p.active_on_servers || []);
+        const activeBadge = activeServers.length > 0
+            ? '<span class="badge badge-ok">used by: ' + activeServers.join(', ') + '</span>'
+            : '';
         const authBadge = p.oauth_enabled
             ? '<span class="badge badge-mode">' + modeLabel + '</span>'
             : '<span class="badge badge-warn">auth off</span>';
-        const deleteBtn = p.is_active
+        const deleteBtn = activeServers.length > 0
             ? ''
             : `<button onclick="deletePreset('${key}')" class="btn-small btn-danger">Delete</button>`;
 
         return `
-            <div class="preset-row ${p.is_active ? 'preset-active' : ''}">
+            <div class="preset-row ${activeServers.length > 0 ? 'preset-active' : ''}">
                 <div class="preset-info">
                     <div class="preset-name">${p.name || key} ${activeBadge}</div>
                     <div class="preset-meta">${authBadge} <span class="preset-key-label">${key}</span></div>
@@ -95,28 +390,6 @@ function renderPresetList() {
                 </div>
             </div>`;
     }).join('');
-}
-
-function populateActivePresetDropdown() {
-    const select = document.getElementById('active-preset-select');
-    const activeKey = currentConfig.active_preset || '';
-    select.innerHTML = '';
-
-    Object.keys(presetsData).forEach(key => {
-        const p = presetsData[key];
-        const opt = document.createElement('option');
-        opt.value = key;
-        opt.textContent = p.name || key;
-        select.appendChild(opt);
-    });
-
-    // Add a "None (no auth)" option
-    const noneOpt = document.createElement('option');
-    noneOpt.value = '';
-    noneOpt.textContent = 'None (no auth)';
-    select.appendChild(noneOpt);
-
-    select.value = activeKey;
 }
 
 // ============================================================
@@ -234,7 +507,6 @@ async function savePreset() {
 
     if (editingPresetKey === '__new__') {
         key = slugify(presetData.name);
-        // Avoid collisions
         if (presetsData[key]) {
             key = key + '-' + Date.now().toString(36).slice(-4);
         }
@@ -265,8 +537,8 @@ async function savePreset() {
 
 async function deletePreset(key) {
     const preset = presetsData[key];
-    if (preset && preset.is_active) {
-        showSaveStatus('Cannot delete the active preset', 'red');
+    if (preset && (preset.active_on_servers || []).length > 0) {
+        showSaveStatus('Cannot delete: preset is used by servers', 'red');
         return;
     }
     if (!confirm('Delete preset "' + (preset ? preset.name : key) + '"?')) return;
@@ -290,248 +562,8 @@ async function deletePreset(key) {
 }
 
 // ============================================================
-// Server Config Tab (agent + active preset)
-// ============================================================
-
-async function saveServerConfig() {
-    const selectedPresetKey = document.getElementById('active-preset-select').value;
-
-    // Save agent config (don't overwrite base_url — it's set correctly in project vars)
-    const config = {
-        agent: {
-            project_key: document.getElementById('agent-project').value.trim(),
-            tool_ids: Array.from(document.querySelectorAll('#tools-list input[type="checkbox"]:checked'))
-                .map(cb => cb.value)
-        }
-    };
-
-    try {
-        // Save agent config
-        const resp = await fetch(backendUrl + 'admin/config', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(config)
-        });
-        const result = await resp.json();
-
-        if (result.status !== 'ok') {
-            showSaveStatus('Save failed', 'red');
-            return;
-        }
-
-        // Activate selected preset
-        if (selectedPresetKey && selectedPresetKey !== currentConfig.active_preset) {
-            await fetch(backendUrl + 'admin/presets/' + encodeURIComponent(selectedPresetKey) + '/activate', {
-                method: 'POST'
-            });
-        }
-
-        showSaveStatus('Saved — changes are live now', 'green');
-        currentConfig.agent = config.agent;
-        currentConfig.base_url = config.base_url;
-        currentConfig.active_preset = selectedPresetKey;
-        await loadPresets();
-        await refreshHealth();
-    } catch (e) {
-        showSaveStatus('Error: ' + e.message, 'red');
-    }
-}
-
-// ============================================================
-// Init
-// ============================================================
-async function init() {
-    try {
-        const [configResp, healthResp] = await Promise.all([
-            fetch(backendUrl + 'admin/config'),
-            fetch(backendUrl + 'admin/health')
-        ]);
-        currentConfig = await configResp.json();
-        const health = await healthResp.json();
-
-        // Load presets (renders list + populates dropdown)
-        await loadPresets();
-
-        // If no presets exist, seed defaults
-        if (Object.keys(presetsData).length === 0) {
-            await seedDefaultPresets();
-        }
-
-        // Populate agent config
-        document.getElementById('agent-project').value = (currentConfig.agent || {}).project_key || '';
-        if ((currentConfig.agent || {}).project_key) {
-            loadAgentTools();
-        }
-
-        updateStatusPills(health);
-        updateConnectionInfo();
-        updateStatusBadge(health);
-        updateChecklist(health);
-    } catch (e) {
-        document.getElementById('status-badge').className = 'badge badge-error';
-        document.getElementById('status-badge').textContent = 'Error';
-        console.error('Init error:', e);
-    }
-}
-
-async function seedDefaultPresets() {
-    // Create Built-in test preset
-    await fetch(backendUrl + 'admin/presets', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-            key: 'builtin-test',
-            preset_data: {
-                name: 'Built-in (Testing)',
-                oauth_mode: 'builtin',
-                oauth_enabled: true,
-                scopes: ['mcp:tools']
-            }
-        })
-    });
-
-    // Create Entra ID example preset
-    await fetch(backendUrl + 'admin/presets', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-            key: 'entra-id-example',
-            preset_data: {
-                name: 'Entra ID (Example)',
-                oauth_mode: 'external',
-                oauth_enabled: true,
-                authorization_server: 'https://login.microsoftonline.com/{your-tenant-id}/v2.0',
-                client_id: '',
-                scopes: ['api://{your-client-id}/mcp.tools']
-            }
-        })
-    });
-
-    // Activate the builtin one by default
-    await fetch(backendUrl + 'admin/presets/builtin-test/activate', { method: 'POST' });
-    currentConfig.active_preset = 'builtin-test';
-
-    await loadPresets();
-}
-
-async function refreshHealth() {
-    try {
-        const healthResp = await fetch(backendUrl + 'admin/health');
-        const health = await healthResp.json();
-        updateStatusPills(health);
-        updateStatusBadge(health);
-        updateChecklist(health);
-        const configResp = await fetch(backendUrl + 'admin/config');
-        currentConfig = await configResp.json();
-    } catch (e) {
-        console.error('Health refresh error:', e);
-    }
-}
-
-function updateStatusPills(health) {
-    // Agent pill
-    const agentPill = document.getElementById('status-agent');
-    agentPill.className = 'status-pill ' + (health.agent_configured ? 'pill-ok' : 'pill-off');
-    agentPill.querySelector('.status-label').textContent = health.agent_configured ? 'Agent ready' : 'No agent';
-
-    // OAuth pill
-    const oauthPill = document.getElementById('status-oauth');
-    oauthPill.className = 'status-pill ' + (health.oauth_enabled ? 'pill-ok' : 'pill-off');
-    oauthPill.querySelector('.status-label').textContent = health.oauth_enabled ? 'OAuth on' : 'OAuth off';
-
-    // Preset pill
-    const presetPill = document.getElementById('status-preset');
-    const presetName = document.getElementById('status-preset-name');
-    if (health.preset_name) {
-        presetPill.className = 'status-pill pill-ok';
-        presetName.textContent = health.preset_name;
-    } else {
-        presetPill.className = 'status-pill pill-off';
-        presetName.textContent = 'No preset';
-    }
-}
-
-function updateStatusBadge(health) {
-    const badge = document.getElementById('status-badge');
-    if (health.status === 'running' && health.agent_configured && health.oauth_enabled) {
-        badge.className = 'badge badge-ok';
-        badge.textContent = 'Ready';
-    } else if (health.status === 'running' && health.agent_configured) {
-        badge.className = 'badge badge-warn';
-        badge.textContent = 'No OAuth';
-    } else if (health.status === 'running') {
-        badge.className = 'badge badge-warn';
-        badge.textContent = 'Needs Config';
-    } else {
-        badge.className = 'badge badge-error';
-        badge.textContent = 'Error';
-    }
-}
-
-function updateChecklist(health) {
-    const checklist = document.getElementById('setup-checklist');
-    const allDone = health.agent_configured && health.oauth_enabled;
-    checklist.style.display = allDone ? 'none' : 'block';
-
-    const checkAgent = document.getElementById('check-agent');
-    checkAgent.className = 'checklist-item ' + (health.agent_configured ? 'check-done' : '');
-    const checkOauth = document.getElementById('check-oauth');
-    checkOauth.className = 'checklist-item ' + (health.oauth_enabled ? 'check-done' : '');
-}
-
-function updateConnectionInfo() {
-    const mcpUrl = autoBaseUrl + '/mcp';
-
-    // Hero URL
-    document.getElementById('mcp-url').textContent = mcpUrl;
-
-    // Client-specific URLs
-    const urlDesktop = document.getElementById('url-claude-desktop');
-    if (urlDesktop) urlDesktop.textContent = mcpUrl;
-    const urlChatgpt = document.getElementById('url-chatgpt');
-    if (urlChatgpt) urlChatgpt.textContent = mcpUrl;
-
-    // Claude Code command
-    const cmdEl = document.getElementById('claude-code-cmd');
-    if (cmdEl) cmdEl.textContent = 'claude mcp add dataiku-mcp -- ' + mcpUrl;
-
-    // Claude Code JSON config
-    const clientConfig = {
-        "mcpServers": {
-            "dataiku-mcp": {
-                "url": mcpUrl,
-                "type": "http"
-            }
-        }
-    };
-    document.getElementById('client-config').textContent = JSON.stringify(clientConfig, null, 2);
-}
-
-// ============================================================
-// Client tab switching (within Connection Info)
-// ============================================================
-document.querySelectorAll('.client-tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-        document.querySelectorAll('.client-tab').forEach(t => t.classList.remove('active'));
-        document.querySelectorAll('.client-panel').forEach(p => p.classList.remove('active'));
-        tab.classList.add('active');
-        document.getElementById('client-' + tab.dataset.client).classList.add('active');
-    });
-});
-
-// ============================================================
 // Shared actions
 // ============================================================
-
-function copyUrl() {
-    const url = document.getElementById('mcp-url').textContent;
-    navigator.clipboard.writeText(url);
-}
-
-function copyCmdClaudeCode() {
-    const cmd = document.getElementById('claude-code-cmd').textContent;
-    navigator.clipboard.writeText(cmd);
-}
 
 async function discoverEndpoints(mode) {
     let issuerInput;
@@ -570,57 +602,158 @@ async function discoverEndpoints(mode) {
     }
 }
 
-async function loadAgentTools() {
-    const projectKey = document.getElementById('agent-project').value.trim();
-    if (!projectKey) return;
+// ============================================================
+// Health & Status
+// ============================================================
 
-    const toolsList = document.getElementById('tools-list');
-    toolsList.innerHTML = '<p class="help">Loading...</p>';
-
+async function refreshHealth() {
     try {
-        const resp = await fetch(backendUrl + 'admin/agents?project_key=' + encodeURIComponent(projectKey));
-        const tools = await resp.json();
-
-        if (tools.length === 0) {
-            toolsList.innerHTML = '<p class="help">No agent tools found in this project.</p>';
-            return;
-        }
-
-        const configuredTools = ((currentConfig.agent || {}).tool_ids || []);
-
-        toolsList.innerHTML = tools.map(t => `
-            <div class="tool-item">
-                <input type="checkbox" id="tool-${t.tool_id}" value="${t.tool_id}"
-                    ${configuredTools.includes(t.tool_id) ? 'checked' : ''}>
-                <div class="tool-info">
-                    <div class="tool-name">${t.tool_name}</div>
-                    <div class="tool-type">${t.tool_type} &middot; ${t.tool_id}</div>
-                </div>
-            </div>
-        `).join('');
+        const healthResp = await fetch(backendUrl + 'admin/health');
+        const health = await healthResp.json();
+        updateStatusBadge(health);
     } catch (e) {
-        toolsList.innerHTML = '<p class="help">Error loading tools: ' + e.message + '</p>';
+        console.error('Health refresh error:', e);
     }
 }
 
-function showSaveStatus(msg, color) {
-    ['save-status', 'save-status-agent'].forEach(id => {
-        const el = document.getElementById(id);
-        if (el) {
-            el.textContent = msg;
-            el.style.color = color;
-            setTimeout(() => { el.textContent = ''; }, 3000);
+function updateStatusBadge(health) {
+    const badge = document.getElementById('status-badge');
+    const count = health.server_count || 0;
+
+    if (health.status === 'running' && count > 0 && health.any_agent_configured && health.any_oauth_enabled) {
+        badge.className = 'badge badge-ok';
+        badge.textContent = count + ' server' + (count !== 1 ? 's' : '') + ' ready';
+    } else if (health.status === 'running' && count > 0 && health.any_agent_configured) {
+        badge.className = 'badge badge-warn';
+        badge.textContent = count + ' server' + (count !== 1 ? 's' : '') + ' (no OAuth)';
+    } else if (health.status === 'running' && count === 0) {
+        badge.className = 'badge badge-warn';
+        badge.textContent = 'No servers';
+    } else if (health.status === 'running') {
+        badge.className = 'badge badge-warn';
+        badge.textContent = 'Needs config';
+    } else {
+        badge.className = 'badge badge-error';
+        badge.textContent = 'Error';
+    }
+}
+
+// ============================================================
+// Init
+// ============================================================
+async function init() {
+    try {
+        const [configResp, healthResp] = await Promise.all([
+            fetch(backendUrl + 'admin/config'),
+            fetch(backendUrl + 'admin/health')
+        ]);
+        currentConfig = await configResp.json();
+        const health = await healthResp.json();
+
+        // Load presets first (needed by server editor dropdowns)
+        await loadPresets();
+
+        // If no presets exist, seed defaults
+        if (Object.keys(presetsData).length === 0) {
+            await seedDefaultPresets();
         }
+
+        // Load servers + project keys for autocomplete
+        await loadServers();
+        loadProjectKeys();
+
+        updateStatusBadge(health);
+    } catch (e) {
+        document.getElementById('status-badge').className = 'badge badge-error';
+        document.getElementById('status-badge').textContent = 'Error';
+        console.error('Init error:', e);
+    }
+}
+
+async function seedDefaultPresets() {
+    await fetch(backendUrl + 'admin/presets', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            key: 'builtin-test',
+            preset_data: {
+                name: 'Built-in (Testing)',
+                oauth_mode: 'builtin',
+                oauth_enabled: true,
+                scopes: ['mcp:tools']
+            }
+        })
     });
+
+    await fetch(backendUrl + 'admin/presets', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            key: 'entra-id-example',
+            preset_data: {
+                name: 'Entra ID (Example)',
+                oauth_mode: 'external',
+                oauth_enabled: true,
+                authorization_server: 'https://login.microsoftonline.com/{your-tenant-id}/v2.0',
+                client_id: '',
+                scopes: ['api://{your-client-id}/mcp.tools']
+            }
+        })
+    });
+
+    await loadPresets();
+}
+
+// ============================================================
+// Debug Log
+// ============================================================
+async function refreshDebugLog() {
+    try {
+        const resp = await fetch(backendUrl + 'admin/debug-log');
+        const logs = await resp.json();
+        const content = document.getElementById('debug-log-content');
+        const count = document.getElementById('debug-log-count');
+        count.textContent = logs.length + ' entries';
+        if (logs.length === 0) {
+            content.textContent = '(empty)';
+            return;
+        }
+        content.textContent = logs.map(e => {
+            const ts = e.t ? new Date(e.t * 1000).toLocaleTimeString() : '--';
+            return `[${ts}] ${e.msg}`;
+        }).join('\n');
+        content.scrollTop = content.scrollHeight;
+    } catch (e) {
+        document.getElementById('debug-log-content').textContent = 'Error: ' + e.message;
+    }
+}
+
+// ============================================================
+// Project key autocomplete
+// ============================================================
+async function loadProjectKeys() {
+    try {
+        const resp = await fetch(backendUrl + 'admin/project-keys');
+        const keys = await resp.json();
+        const datalist = document.getElementById('project-keys-list');
+        datalist.innerHTML = keys.map(k => `<option value="${k}">`).join('');
+    } catch (e) {
+        console.error('Failed to load project keys:', e);
+    }
 }
 
 // Expose functions (Dataiku wraps JS in IIFE)
-window.copyUrl = copyUrl;
-window.copyCmdClaudeCode = copyCmdClaudeCode;
+window.refreshDebugLog = refreshDebugLog;
+window.copyServerUrl = copyServerUrl;
+window.copyServerCmd = copyServerCmd;
 window.discoverEndpoints = discoverEndpoints;
-window.loadAgentTools = loadAgentTools;
+window.loadServerAgentTools = loadServerAgentTools;
 window.savePreset = savePreset;
-window.saveServerConfig = saveServerConfig;
+window.saveServer = saveServer;
+window.deleteServer = deleteServer;
+window.editServer = editServer;
+window.openNewServer = openNewServer;
+window.closeServerEditor = closeServerEditor;
 window.deletePreset = deletePreset;
 window.editPreset = editPreset;
 window.openNewPreset = openNewPreset;

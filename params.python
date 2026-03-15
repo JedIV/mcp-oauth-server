@@ -3,6 +3,7 @@ import json
 import uuid
 import time
 import logging
+import re
 import requests as http_requests
 from functools import wraps
 from flask import request, make_response, Response
@@ -13,44 +14,75 @@ logger = logging.getLogger(__name__)
 # Configuration Management (stored in project variables)
 # ============================================================
 
-# OAuth fields that belong in presets (not top-level)
 PRESET_FIELDS = {'oauth_mode', 'oauth_enabled', 'authorization_server', 'client_id',
                  'client_secret', 'scopes', 'introspection_endpoint'}
 
+SERVER_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{0,38}[a-z0-9]$|^[a-z0-9]$')
+
+def is_valid_server_name(name):
+    return bool(SERVER_NAME_RE.match(name))
+
 def get_config():
-    """Load MCP OAuth config from project variables, auto-migrating to preset format."""
+    """Load MCP OAuth config from project variables, auto-migrating to v2 format."""
     try:
         project = dataiku.api_client().get_default_project()
         variables = project.get_variables()
         config = variables.get('standard', {}).get('mcp_oauth_config', {})
 
-        # Auto-migrate: if 'presets' key is missing, convert flat config to preset format
-        if 'presets' not in config and config.get('oauth_mode'):
-            config = _migrate_flat_to_presets(config)
-            # Save migrated config
+        # Auto-migrate v1 (flat/presets) to v2 (servers)
+        if config.get('config_version') != 2:
+            config = _migrate_to_v2(config)
             if 'standard' not in variables:
                 variables['standard'] = {}
             variables['standard']['mcp_oauth_config'] = config
             project.set_variables(variables)
-            logger.info("Auto-migrated flat config to preset format")
+            logger.info("Auto-migrated config to v2 (multi-server)")
 
         return config
     except Exception as e:
         logger.error(f"Error loading config: {e}")
-        return {}
+        return {'config_version': 2, 'presets': {}, 'servers': {}}
+
+def _migrate_to_v2(config):
+    """Migrate any older config format to v2 with servers dict."""
+    # First ensure presets exist (handle pre-preset flat config)
+    if 'presets' not in config and config.get('oauth_mode'):
+        config = _migrate_flat_to_presets(config)
+
+    presets = config.get('presets', {})
+    active_preset = config.get('active_preset', '')
+    agent = config.get('agent', {})
+
+    new_config = {
+        'config_version': 2,
+        'presets': presets,
+        'servers': {},
+    }
+
+    # Preserve base_url if set
+    if config.get('base_url'):
+        new_config['base_url'] = config['base_url']
+
+    # If there was an agent or active preset, create a 'default' server
+    if agent or active_preset:
+        new_config['servers']['default'] = {
+            'display_name': 'Default',
+            'active_preset': active_preset,
+            'agent': agent,
+        }
+
+    return new_config
 
 def _migrate_flat_to_presets(config):
-    """Migrate a flat config (pre-presets) into the new preset structure."""
+    """Migrate a flat config (pre-presets) into the preset structure."""
     mode = config.get('oauth_mode', 'builtin')
     preset_key = mode + '-default'
 
-    # Extract preset fields
     preset_data = {'name': _default_preset_name(mode)}
     for field in PRESET_FIELDS:
         if field in config:
             preset_data[field] = config[field]
 
-    # Build new config keeping top-level fields
     new_config = {}
     for k, v in config.items():
         if k not in PRESET_FIELDS:
@@ -77,25 +109,27 @@ def save_config(config):
     variables['standard']['mcp_oauth_config'] = config
     project.set_variables(variables)
 
-def get_active_preset(config=None):
-    """Get the active preset dict. Falls back gracefully."""
-    if config is None:
-        config = get_config()
+def get_server_config(config, server_name):
+    """Get a server's config dict from the top-level config."""
+    return config.get('servers', {}).get(server_name, {})
+
+def get_active_preset(config, server_name=None):
+    """Get the active preset dict for a server. Falls back gracefully."""
     presets = config.get('presets', {})
-    active_key = config.get('active_preset', '')
+    if server_name:
+        server = get_server_config(config, server_name)
+        active_key = server.get('active_preset', '')
+    else:
+        active_key = ''
     if active_key and active_key in presets:
         return presets[active_key]
-    # Fallback: return first preset if any
     if presets:
         return next(iter(presets.values()))
-    # No presets at all — return empty dict (unconfigured)
     return {}
 
-def get_oauth_mode(config=None):
-    """Get the current OAuth mode from the active preset."""
-    if config is None:
-        config = get_config()
-    preset = get_active_preset(config)
+def get_oauth_mode(config, server_name=None):
+    """Get the current OAuth mode from the active preset for a server."""
+    preset = get_active_preset(config, server_name)
     return preset.get('oauth_mode', 'builtin')
 
 # ============================================================
@@ -109,11 +143,7 @@ def debug(msg):
         _debug_log.pop(0)
     logger.info(msg)
 
-@app.route('/admin/debug-log')
-def get_debug_log():
-    resp = make_response(json.dumps(_debug_log, indent=2))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
+# debug-log route registered after require_dataiku_auth is defined (see bottom of admin section)
 
 # ============================================================
 # CORS handling
@@ -127,15 +157,14 @@ def add_cors_headers(response):
     response.headers['Access-Control-Expose-Headers'] = 'Mcp-Session-Id'
     return response
 
-@app.route('/mcp', methods=['OPTIONS'])
-def mcp_options():
+@app.route('/servers/<server_name>/mcp', methods=['OPTIONS'])
+def mcp_options(server_name):
     return make_response('', 204)
 
 # ============================================================
 # Token Validation
 # ============================================================
 
-# JWKS cache for JWT validation
 _jwks_cache = {'keys': None, 'fetched_at': 0}
 
 def get_jwks(jwks_uri):
@@ -154,8 +183,7 @@ def get_jwks(jwks_uri):
     return _jwks_cache.get('keys')
 
 def validate_token_jwt(token, preset):
-    """Validate a JWT token by decoding and checking claims.
-    Uses preset config for client_id/authorization_server."""
+    """Validate a JWT token by decoding and checking claims."""
     client_id = preset.get('client_id', '')
 
     try:
@@ -201,13 +229,12 @@ def validate_token_jwt(token, preset):
         debug(f'JWT VALIDATION ERROR: {type(e).__name__}: {e}')
         return None
 
-def validate_token(token):
-    """Validate Bearer token. Supports built-in OAuth, JWT (Entra), and introspection."""
+def validate_token(token, server_name):
+    """Validate Bearer token for a specific server. Supports built-in OAuth, JWT, and introspection."""
     config = get_config()
-    preset = get_active_preset(config)
+    preset = get_active_preset(config, server_name)
     mode = preset.get('oauth_mode', 'builtin')
 
-    # Built-in mode: check in-memory store directly
     if mode == 'builtin':
         if token in oauth_tokens_store:
             td = oauth_tokens_store[token]
@@ -217,14 +244,12 @@ def validate_token(token):
                 return {'active': True, 'client_id': td['client_id'], 'scope': td['scope'], 'sub': td['user']}
         return None
 
-    # External mode (proxy): try JWT validation first, then introspection fallback
     if mode == 'external':
         if token.count('.') == 2:
             result = validate_token_jwt(token, preset)
             if result is not None:
                 return result
 
-    # Direct mode or external fallback: introspection endpoint (RFC 7662)
     introspection_url = preset.get('introspection_endpoint', '')
     client_id = preset.get('client_id', '')
     client_secret = preset.get('client_secret', '')
@@ -267,13 +292,13 @@ def get_base_url():
     return request.url_root.rstrip('/')
 
 def require_bearer_auth(f):
-    """Decorator: require OAuth Bearer token on MCP endpoints."""
+    """Decorator: require OAuth Bearer token on MCP endpoints. Uses server_name from URL."""
     @wraps(f)
     def decorated(*args, **kwargs):
+        server_name = kwargs.get('server_name', 'default')
         config = get_config()
-        preset = get_active_preset(config)
+        preset = get_active_preset(config, server_name)
 
-        # If OAuth is not enabled, pass through
         if not preset.get('oauth_enabled', False):
             return f(*args, **kwargs)
 
@@ -283,14 +308,14 @@ def require_bearer_auth(f):
             resp = make_response('', 401)
             resp.headers['WWW-Authenticate'] = (
                 'Bearer realm="mcp", '
-                'resource_metadata="' + base_url + '/.well-known/oauth-protected-resource"'
+                'resource_metadata="' + base_url + '/servers/' + server_name + '/.well-known/oauth-protected-resource"'
             )
             return resp
 
         token = auth_header[7:]
-        token_data = validate_token(token)
+        token_data = validate_token(token, server_name)
         if token_data is None:
-            debug(f'MCP AUTH: Token validation failed for token starting with {token[:20]}...')
+            debug(f'MCP AUTH: Token validation failed for server={server_name} token={token[:20]}...')
             resp = make_response('', 401)
             resp.headers['WWW-Authenticate'] = 'Bearer error="invalid_token"'
             return resp
@@ -303,9 +328,9 @@ def require_bearer_auth(f):
 # MCP Protocol (StreamableHTTP, JSON-RPC 2.0)
 # ============================================================
 
-sessions = {}  # session_id -> {created, last_active}
+sessions = {}  # sessions[server_name][session_id] -> {created, last_active}
 
-def handle_mcp_message(message):
+def handle_mcp_message(message, server_name):
     """Route a single MCP JSON-RPC message to the right handler."""
     method = message.get('method', '')
     msg_id = message.get('id')
@@ -313,15 +338,15 @@ def handle_mcp_message(message):
 
     handlers = {
         'initialize': handle_initialize,
-        'notifications/initialized': lambda p, i: None,
+        'notifications/initialized': lambda p, i, s: None,
         'tools/list': handle_tools_list,
         'tools/call': handle_tools_call,
-        'ping': lambda p, i: {'jsonrpc': '2.0', 'id': i, 'result': {}},
+        'ping': lambda p, i, s: {'jsonrpc': '2.0', 'id': i, 'result': {}},
     }
 
     handler = handlers.get(method)
     if handler:
-        return handler(params, msg_id)
+        return handler(params, msg_id, server_name)
 
     return {
         'jsonrpc': '2.0',
@@ -329,7 +354,10 @@ def handle_mcp_message(message):
         'error': {'code': -32601, 'message': f'Method not found: {method}'}
     }
 
-def handle_initialize(params, msg_id):
+def handle_initialize(params, msg_id, server_name):
+    config = get_config()
+    server = get_server_config(config, server_name)
+    display_name = server.get('display_name', server_name)
     return {
         'jsonrpc': '2.0',
         'id': msg_id,
@@ -339,25 +367,25 @@ def handle_initialize(params, msg_id):
                 'tools': {'listChanged': False}
             },
             'serverInfo': {
-                'name': 'dataiku-mcp-oauth',
+                'name': f'dataiku-mcp-{server_name}',
                 'version': '1.0.0'
             }
         }
     }
 
-def handle_tools_list(params, msg_id):
+def handle_tools_list(params, msg_id, server_name):
     config = get_config()
-    tools = build_tool_definitions(config)
+    tools = build_tool_definitions(config, server_name)
     return {
         'jsonrpc': '2.0',
         'id': msg_id,
         'result': {'tools': tools}
     }
 
-def handle_tools_call(params, msg_id):
+def handle_tools_call(params, msg_id, server_name):
     tool_name = params.get('name', '')
     arguments = params.get('arguments', {})
-    result = call_agent_tool(tool_name, arguments)
+    result = call_agent_tool(tool_name, arguments, server_name)
     return {
         'jsonrpc': '2.0',
         'id': msg_id,
@@ -368,10 +396,11 @@ def handle_tools_call(params, msg_id):
 # Agent Tool Integration
 # ============================================================
 
-def build_tool_definitions(config):
-    """Build MCP tool definitions from configured Dataiku agent tools."""
+def build_tool_definitions(config, server_name):
+    """Build MCP tool definitions from configured Dataiku agent tools for a server."""
     tools = []
-    agent_config = config.get('agent', {})
+    server = get_server_config(config, server_name)
+    agent_config = server.get('agent', {})
     project_key = agent_config.get('project_key', '')
     tool_ids = agent_config.get('tool_ids', [])
 
@@ -408,17 +437,17 @@ def build_tool_definitions(config):
 
     return tools
 
-def call_agent_tool(tool_name, arguments):
+def call_agent_tool(tool_name, arguments, server_name):
     """Execute a Dataiku agent tool and return MCP-formatted result."""
     config = get_config()
-    agent_config = config.get('agent', {})
+    server = get_server_config(config, server_name)
+    agent_config = server.get('agent', {})
     project_key = agent_config.get('project_key', '')
 
     try:
         api_client = dataiku.api_client()
         project = api_client.get_project(project_key)
 
-        # Resolve tool name to ID (MCP uses name, Dataiku uses ID)
         tool_id = tool_name
         for tid in agent_config.get('tool_ids', []):
             t = project.get_agent_tool(tid)
@@ -428,7 +457,6 @@ def call_agent_tool(tool_name, arguments):
                 break
 
         tool = project.get_agent_tool(tool_id)
-
         query = arguments.get('query', '')
         output = tool.run({'question': query})
 
@@ -451,10 +479,10 @@ import hashlib
 import base64
 import secrets
 
-# In-memory stores
-oauth_clients = {}      # client_id -> {client_secret, redirect_uris, client_name, grant_types}
-oauth_auth_codes = {}   # code -> {client_id, redirect_uri, code_challenge, code_challenge_method, scope, expires, user}
-oauth_tokens_store = {} # token -> {client_id, scope, expires, user, active}
+# In-memory stores (shared across all servers using built-in mode)
+oauth_clients = {}
+oauth_auth_codes = {}
+oauth_tokens_store = {}
 
 # Pre-register a test client
 oauth_clients['test-client'] = {
@@ -478,7 +506,7 @@ def verify_pkce(code_verifier, code_challenge, method='S256'):
         return code_verifier == code_challenge
     return False
 
-def build_login_html(client_name, scope, client_id, redirect_uri, state, code_challenge, code_challenge_method, base_url):
+def build_login_html(client_name, scope, client_id, redirect_uri, state, code_challenge, code_challenge_method, base_url, server_name):
     return """<!DOCTYPE html>
 <html><head><title>MCP OAuth - Authorize</title>
 <style>
@@ -497,7 +525,7 @@ input[type="text"], input[type="password"] { width: 100%%; padding: 8px 12px; bo
 <h2>Authorize Access</h2>
 <p><span class="client-name">%s</span> wants to access your MCP tools.</p>
 <p>Requested scope: <span class="scope">%s</span></p>
-<form method="POST" action="%s/oauth/authorize/submit">
+<form method="POST" action="%s/servers/%s/oauth/authorize/submit">
 <input type="hidden" name="client_id" value="%s">
 <input type="hidden" name="redirect_uri" value="%s">
 <input type="hidden" name="scope" value="%s">
@@ -509,14 +537,23 @@ input[type="text"], input[type="password"] { width: 100%%; padding: 8px 12px; bo
 <button type="submit" class="btn">Approve</button>
 </form>
 <p class="help">Test credentials: admin / admin</p>
-</div></body></html>""" % (client_name, scope, base_url, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method)
+</div></body></html>""" % (client_name, scope, base_url, server_name, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method)
 
-@app.route('/.well-known/openid-configuration')
-def oidc_discovery():
+
+# ============================================================
+# Per-server OAuth Discovery & Endpoints
+# ============================================================
+
+@app.route('/servers/<server_name>/.well-known/openid-configuration')
+def oidc_discovery(server_name):
     config = get_config()
-    preset = get_active_preset(config)
+    if server_name not in config.get('servers', {}):
+        return make_response(json.dumps({'error': 'Unknown server'}), 404)
+
+    preset = get_active_preset(config, server_name)
     mode = preset.get('oauth_mode', 'builtin')
     base_url = get_base_url()
+    server_base = base_url + '/servers/' + server_name
 
     if mode == 'direct':
         auth_server = preset.get('authorization_server', '').rstrip('/')
@@ -531,11 +568,11 @@ def oidc_discovery():
                 debug(f'OIDC DISCOVERY: Failed to proxy to {auth_server}: {e}')
 
     metadata = {
-        'issuer': base_url,
-        'authorization_endpoint': base_url + '/oauth/authorize',
-        'token_endpoint': base_url + '/oauth/token',
-        'introspection_endpoint': base_url + '/oauth/introspect',
-        'registration_endpoint': base_url + '/oauth/register',
+        'issuer': server_base,
+        'authorization_endpoint': server_base + '/oauth/authorize',
+        'token_endpoint': server_base + '/oauth/token',
+        'introspection_endpoint': server_base + '/oauth/introspect',
+        'registration_endpoint': server_base + '/oauth/register',
         'response_types_supported': ['code'],
         'grant_types_supported': ['authorization_code', 'refresh_token'],
         'code_challenge_methods_supported': ['S256', 'plain'],
@@ -547,17 +584,51 @@ def oidc_discovery():
     resp.headers['Content-Type'] = 'application/json'
     return resp
 
-@app.route('/.well-known/oauth-authorization-server')
-def oauth_as_metadata():
-    return oidc_discovery()
+@app.route('/servers/<server_name>/.well-known/oauth-authorization-server')
+def oauth_as_metadata(server_name):
+    return oidc_discovery(server_name)
 
-@app.route('/oauth/register', methods=['POST'])
-def oauth_register():
+@app.route('/servers/<server_name>/.well-known/oauth-protected-resource')
+def oauth_protected_resource(server_name):
+    """RFC 9728 Protected Resource Metadata."""
     config = get_config()
-    preset = get_active_preset(config)
+    if server_name not in config.get('servers', {}):
+        return make_response(json.dumps({'error': 'Unknown server'}), 404)
+
+    preset = get_active_preset(config, server_name)
+    mode = preset.get('oauth_mode', 'builtin')
+    base_url = get_base_url()
+    server_base = base_url + '/servers/' + server_name
+
+    if mode == 'direct':
+        auth_server = preset.get('authorization_server', '').rstrip('/')
+        metadata = {
+            'resource': server_base + '/mcp',
+            'authorization_servers': [auth_server] if auth_server else [server_base],
+            'scopes_supported': preset.get('scopes', ['mcp:tools']),
+            'bearer_methods_supported': ['header']
+        }
+    else:
+        metadata = {
+            'resource': server_base + '/mcp',
+            'authorization_servers': [server_base],
+            'scopes_supported': preset.get('scopes', ['mcp:tools']),
+            'bearer_methods_supported': ['header']
+        }
+
+    resp = make_response(json.dumps(metadata))
+    resp.headers['Content-Type'] = 'application/json'
+    return resp
+
+@app.route('/servers/<server_name>/oauth/register', methods=['POST'])
+def oauth_register(server_name):
+    config = get_config()
+    if server_name not in config.get('servers', {}):
+        return make_response(json.dumps({'error': 'Unknown server'}), 404)
+
+    preset = get_active_preset(config, server_name)
     mode = preset.get('oauth_mode', 'builtin')
 
-    # External mode: return pre-registered app credentials (proxy DCR)
     if mode == 'external':
         body = request.get_json(force=True)
         client_data = {
@@ -579,7 +650,7 @@ def oauth_register():
             'error_description': 'Direct mode: use the external authorization server for client registration'
         }), 400)
 
-    # Built-in mode: generate new client
+    # Built-in mode
     body = request.get_json(force=True)
     client_id = str(uuid.uuid4())
     client_secret = secrets.token_urlsafe(32)
@@ -596,13 +667,15 @@ def oauth_register():
     resp.headers['Content-Type'] = 'application/json'
     return resp, 201
 
-@app.route('/oauth/authorize', methods=['GET'])
-def oauth_authorize():
+@app.route('/servers/<server_name>/oauth/authorize', methods=['GET'])
+def oauth_authorize(server_name):
     config = get_config()
-    preset = get_active_preset(config)
+    if server_name not in config.get('servers', {}):
+        return make_response(json.dumps({'error': 'Unknown server'}), 404)
+
+    preset = get_active_preset(config, server_name)
     mode = preset.get('oauth_mode', 'builtin')
 
-    # External mode: redirect to external auth server's authorize endpoint
     if mode == 'external':
         auth_server = preset.get('authorization_server', '').rstrip('/')
         try:
@@ -614,7 +687,6 @@ def oauth_authorize():
 
         from urllib.parse import urlencode
         params = dict(request.args)
-        # Entra doesn't support RFC 8707 resource parameter alongside scopes
         params.pop('resource', None)
         debug(f'AUTH PROXY: Redirecting to {ext_authorize} with params: {params}')
         redirect_url = ext_authorize + '?' + urlencode(params)
@@ -625,7 +697,7 @@ def oauth_authorize():
     if mode == 'direct':
         return make_response('Direct mode: clients should authorize with the external server directly', 400)
 
-    # Built-in mode: show login form
+    # Built-in mode
     client_id = request.args.get('client_id', '')
     redirect_uri = request.args.get('redirect_uri', '')
     scope = request.args.get('scope', 'mcp:tools')
@@ -640,13 +712,13 @@ def oauth_authorize():
 
     client_name = oauth_clients[client_id].get('client_name', client_id)
     burl = get_base_url()
-    html = build_login_html(client_name, scope, client_id, redirect_uri, state, code_challenge, code_challenge_method, burl)
+    html = build_login_html(client_name, scope, client_id, redirect_uri, state, code_challenge, code_challenge_method, burl, server_name)
     resp = make_response(html)
     resp.headers['Content-Type'] = 'text/html'
     return resp
 
-@app.route('/oauth/authorize/submit', methods=['POST'])
-def oauth_authorize_submit():
+@app.route('/servers/<server_name>/oauth/authorize/submit', methods=['POST'])
+def oauth_authorize_submit(server_name):
     username = request.form.get('username', '')
     password = request.form.get('password', '')
     client_id = request.form.get('client_id', '')
@@ -678,13 +750,15 @@ def oauth_authorize_submit():
     resp.headers['Location'] = redirect_url
     return resp
 
-@app.route('/oauth/token', methods=['POST'])
-def oauth_token():
+@app.route('/servers/<server_name>/oauth/token', methods=['POST'])
+def oauth_token(server_name):
     config = get_config()
-    preset = get_active_preset(config)
+    if server_name not in config.get('servers', {}):
+        return make_response(json.dumps({'error': 'Unknown server'}), 404)
+
+    preset = get_active_preset(config, server_name)
     mode = preset.get('oauth_mode', 'builtin')
 
-    # External mode: forward token request to external auth server
     if mode == 'external':
         auth_server = preset.get('authorization_server', '').rstrip('/')
         try:
@@ -695,10 +769,8 @@ def oauth_token():
             return make_response(json.dumps({'error': 'server_error', 'error_description': 'Could not discover token endpoint'}), 500)
 
         form_data = request.form.to_dict() if request.form else {}
-        # Strip 'resource' param - Entra doesn't support RFC 8707 resource indicators
         form_data.pop('resource', None)
         debug(f'TOKEN PROXY: Forwarding to {ext_token_url}')
-        debug(f'TOKEN PROXY: grant_type={form_data.get("grant_type")} client_id={form_data.get("client_id")}')
 
         ext_resp = http_requests.post(
             ext_token_url,
@@ -706,7 +778,6 @@ def oauth_token():
             headers={'Content-Type': 'application/x-www-form-urlencoded'},
             timeout=15
         )
-        debug(f'TOKEN PROXY: Response status={ext_resp.status_code}')
 
         resp = make_response(ext_resp.text, ext_resp.status_code)
         resp.headers['Content-Type'] = ext_resp.headers.get('Content-Type', 'application/json')
@@ -769,8 +840,8 @@ def oauth_token():
     resp.headers['Cache-Control'] = 'no-store'
     return resp
 
-@app.route('/oauth/introspect', methods=['POST'])
-def oauth_introspect():
+@app.route('/servers/<server_name>/oauth/introspect', methods=['POST'])
+def oauth_introspect(server_name):
     token = request.form.get('token', '')
     if not token or token not in oauth_tokens_store:
         resp = make_response(json.dumps({'active': False}))
@@ -792,54 +863,29 @@ def oauth_introspect():
 
 
 # ============================================================
-# Routes: OAuth Metadata
+# Routes: MCP Endpoint (per-server)
 # ============================================================
 
-@app.route('/.well-known/oauth-protected-resource')
-def oauth_protected_resource():
-    """RFC 9728 Protected Resource Metadata."""
-    config = get_config()
-    preset = get_active_preset(config)
-    mode = preset.get('oauth_mode', 'builtin')
-    base_url = get_base_url()
-
-    if mode == 'direct':
-        auth_server = preset.get('authorization_server', '').rstrip('/')
-        metadata = {
-            'resource': base_url + '/mcp',
-            'authorization_servers': [auth_server] if auth_server else [base_url],
-            'scopes_supported': preset.get('scopes', ['mcp:tools']),
-            'bearer_methods_supported': ['header']
-        }
-    else:
-        metadata = {
-            'resource': base_url + '/mcp',
-            'authorization_servers': [base_url],
-            'scopes_supported': preset.get('scopes', ['mcp:tools']),
-            'bearer_methods_supported': ['header']
-        }
-
-    resp = make_response(json.dumps(metadata))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
-
-# ============================================================
-# Routes: MCP Endpoint
-# ============================================================
-
-@app.route('/mcp', methods=['POST'])
+@app.route('/servers/<server_name>/mcp', methods=['POST'])
 @require_bearer_auth
-def mcp_post():
+def mcp_post(server_name):
     """MCP StreamableHTTP POST handler."""
+    config = get_config()
+    if server_name not in config.get('servers', {}):
+        return make_response(json.dumps({'error': 'Unknown server'}), 404)
+
     body = request.get_json(force=True)
     session_id = request.headers.get('Mcp-Session-Id')
+
+    if server_name not in sessions:
+        sessions[server_name] = {}
 
     if not session_id:
         if isinstance(body, dict) and body.get('method') == 'initialize':
             new_session_id = str(uuid.uuid4())
-            sessions[new_session_id] = {'created': time.time(), 'last_active': time.time()}
+            sessions[server_name][new_session_id] = {'created': time.time(), 'last_active': time.time()}
 
-            result = handle_mcp_message(body)
+            result = handle_mcp_message(body, server_name)
             resp = make_response(json.dumps(result))
             resp.headers['Content-Type'] = 'application/json'
             resp.headers['Mcp-Session-Id'] = new_session_id
@@ -851,20 +897,20 @@ def mcp_post():
                 'id': body.get('id') if isinstance(body, dict) else None
             }), 400)
 
-    if session_id not in sessions:
+    if session_id not in sessions.get(server_name, {}):
         return make_response(json.dumps({
             'jsonrpc': '2.0',
             'error': {'code': -32000, 'message': 'Invalid session ID'},
             'id': body.get('id') if isinstance(body, dict) else None
         }), 400)
 
-    sessions[session_id]['last_active'] = time.time()
+    sessions[server_name][session_id]['last_active'] = time.time()
 
     if isinstance(body, list):
-        results = [r for msg in body if (r := handle_mcp_message(msg)) is not None]
+        results = [r for msg in body if (r := handle_mcp_message(msg, server_name)) is not None]
         resp = make_response(json.dumps(results))
     else:
-        result = handle_mcp_message(body)
+        result = handle_mcp_message(body, server_name)
         if result is None:
             return make_response('', 202)
         resp = make_response(json.dumps(result))
@@ -873,25 +919,25 @@ def mcp_post():
     resp.headers['Mcp-Session-Id'] = session_id
     return resp
 
-@app.route('/mcp', methods=['GET'])
+@app.route('/servers/<server_name>/mcp', methods=['GET'])
 @require_bearer_auth
-def mcp_get():
+def mcp_get(server_name):
     """MCP StreamableHTTP GET handler (SSE stream, optional)."""
     session_id = request.headers.get('Mcp-Session-Id')
-    if not session_id or session_id not in sessions:
+    if not session_id or session_id not in sessions.get(server_name, {}):
         return make_response('Invalid or missing session ID', 400)
 
     def generate():
         yield 'event: ping\ndata: {}\n\n'
     return Response(generate(), mimetype='text/event-stream')
 
-@app.route('/mcp', methods=['DELETE'])
+@app.route('/servers/<server_name>/mcp', methods=['DELETE'])
 @require_bearer_auth
-def mcp_delete():
+def mcp_delete(server_name):
     """MCP session cleanup."""
     session_id = request.headers.get('Mcp-Session-Id')
-    if session_id and session_id in sessions:
-        del sessions[session_id]
+    if session_id and server_name in sessions and session_id in sessions[server_name]:
+        del sessions[server_name][session_id]
     return make_response('', 200)
 
 # ============================================================
@@ -919,7 +965,6 @@ def require_dataiku_auth(f):
             return f(*args, **kwargs)
 
         referer = request.headers.get('Referer', '')
-        logger.info(f"Admin auth check: referer='{referer}', has X-DKU-AuthenticatedUser={bool(request.headers.get('X-DKU-AuthenticatedUser'))}, has X-DKU-APIKey={bool(dku_api_key)}")
         if '/projects/' in referer and '/webapps/' in referer:
             return f(*args, **kwargs)
 
@@ -936,7 +981,6 @@ def get_admin_config():
     """Return current config (sans secrets in presets)."""
     config = get_config()
     safe = dict(config)
-    # Strip secrets from presets
     if 'presets' in safe:
         safe_presets = {}
         for key, preset in safe['presets'].items():
@@ -944,9 +988,7 @@ def get_admin_config():
             sp['has_client_secret'] = bool(preset.get('client_secret'))
             safe_presets[key] = sp
         safe['presets'] = safe_presets
-    # Also strip top-level client_secret (legacy)
     safe.pop('client_secret', None)
-    safe['has_client_secret'] = bool(config.get('client_secret'))
     resp = make_response(json.dumps(safe))
     resp.headers['Content-Type'] = 'application/json'
     return resp
@@ -954,16 +996,87 @@ def get_admin_config():
 @app.route('/admin/config', methods=['POST'])
 @require_dataiku_auth
 def save_admin_config():
-    """Save top-level config (agent, base_url). OAuth fields go through preset endpoints."""
+    """Save top-level config fields. OAuth fields go through preset endpoints."""
     new_config = request.get_json(force=True)
     existing = get_config()
 
-    # Preserve fields not included in the save payload
-    for key in ('presets', 'active_preset', 'base_url'):
+    for key in ('presets', 'servers', 'base_url', 'config_version'):
         if key not in new_config and key in existing:
             new_config[key] = existing[key]
 
+    new_config['config_version'] = 2
     save_config(new_config)
+    resp = make_response(json.dumps({'status': 'ok'}))
+    resp.headers['Content-Type'] = 'application/json'
+    return resp
+
+# ============================================================
+# Routes: Server Management
+# ============================================================
+
+@app.route('/admin/servers', methods=['GET'])
+@require_dataiku_auth
+def list_servers():
+    """List all servers."""
+    config = get_config()
+    servers = config.get('servers', {})
+    base_url = get_base_url()
+    result = {}
+    for name, server in servers.items():
+        preset_key = server.get('active_preset', '')
+        preset = config.get('presets', {}).get(preset_key, {})
+        agent = server.get('agent', {})
+        result[name] = {
+            'display_name': server.get('display_name', name),
+            'active_preset': preset_key,
+            'preset_name': preset.get('name', preset_key),
+            'oauth_enabled': preset.get('oauth_enabled', False),
+            'oauth_mode': preset.get('oauth_mode', ''),
+            'agent': agent,
+            'agent_configured': bool(agent.get('project_key') and agent.get('tool_ids')),
+            'mcp_url': base_url + '/servers/' + name + '/mcp',
+        }
+    resp = make_response(json.dumps(result))
+    resp.headers['Content-Type'] = 'application/json'
+    return resp
+
+@app.route('/admin/servers', methods=['POST'])
+@require_dataiku_auth
+def save_server():
+    """Create or update a server. Body: {name, server_data}."""
+    body = request.get_json(force=True)
+    name = body.get('name', '').strip()
+    server_data = body.get('server_data', {})
+
+    if not name:
+        return make_response(json.dumps({'error': 'Server name is required'}), 400)
+    if not is_valid_server_name(name):
+        return make_response(json.dumps({'error': 'Server name must be a URL-safe slug (lowercase letters, numbers, hyphens)'}), 400)
+
+    config = get_config()
+    if 'servers' not in config:
+        config['servers'] = {}
+
+    config['servers'][name] = server_data
+    save_config(config)
+    resp = make_response(json.dumps({'status': 'ok', 'name': name}))
+    resp.headers['Content-Type'] = 'application/json'
+    return resp
+
+@app.route('/admin/servers/<name>', methods=['DELETE'])
+@require_dataiku_auth
+def delete_server(name):
+    """Delete a server."""
+    config = get_config()
+    servers = config.get('servers', {})
+
+    if name not in servers:
+        return make_response(json.dumps({'error': 'Server not found'}), 404)
+
+    del servers[name]
+    # Clean up sessions
+    sessions.pop(name, None)
+    save_config(config)
     resp = make_response(json.dumps({'status': 'ok'}))
     resp.headers['Content-Type'] = 'application/json'
     return resp
@@ -978,12 +1091,18 @@ def list_presets():
     """List all presets (sans secrets)."""
     config = get_config()
     presets = config.get('presets', {})
-    active_key = config.get('active_preset', '')
+    # Determine which presets are active on which servers
+    active_on = {}
+    for sname, sconf in config.get('servers', {}).items():
+        pk = sconf.get('active_preset', '')
+        if pk:
+            active_on.setdefault(pk, []).append(sname)
+
     result = {}
     for key, preset in presets.items():
         safe = {k: v for k, v in preset.items() if k != 'client_secret'}
         safe['has_client_secret'] = bool(preset.get('client_secret'))
-        safe['is_active'] = (key == active_key)
+        safe['active_on_servers'] = active_on.get(key, [])
         result[key] = safe
     resp = make_response(json.dumps(result))
     resp.headers['Content-Type'] = 'application/json'
@@ -1004,18 +1123,12 @@ def save_preset():
     if 'presets' not in config:
         config['presets'] = {}
 
-    # Preserve existing client_secret if not provided
     if key in config['presets'] and 'client_secret' not in preset_data:
         existing_secret = config['presets'][key].get('client_secret')
         if existing_secret:
             preset_data['client_secret'] = existing_secret
 
     config['presets'][key] = preset_data
-
-    # If this is the first preset, auto-activate it
-    if not config.get('active_preset') or config['active_preset'] not in config['presets']:
-        config['active_preset'] = key
-
     save_config(config)
     resp = make_response(json.dumps({'status': 'ok', 'key': key}))
     resp.headers['Content-Type'] = 'application/json'
@@ -1024,15 +1137,19 @@ def save_preset():
 @app.route('/admin/presets/<key>', methods=['DELETE'])
 @require_dataiku_auth
 def delete_preset(key):
-    """Delete a preset. Cannot delete the active preset."""
+    """Delete a preset. Cannot delete if active on any server."""
     config = get_config()
     presets = config.get('presets', {})
 
     if key not in presets:
         return make_response(json.dumps({'error': 'Preset not found'}), 404)
 
-    if key == config.get('active_preset'):
-        return make_response(json.dumps({'error': 'Cannot delete the active preset. Activate a different preset first.'}), 400)
+    # Check if active on any server
+    for sname, sconf in config.get('servers', {}).items():
+        if sconf.get('active_preset') == key:
+            return make_response(json.dumps({
+                'error': f'Cannot delete: preset is active on server "{sname}". Change the server\'s preset first.'
+            }), 400)
 
     del presets[key]
     save_config(config)
@@ -1040,25 +1157,22 @@ def delete_preset(key):
     resp.headers['Content-Type'] = 'application/json'
     return resp
 
-@app.route('/admin/presets/<key>/activate', methods=['POST'])
-@require_dataiku_auth
-def activate_preset(key):
-    """Set a preset as the active one."""
-    config = get_config()
-    presets = config.get('presets', {})
-
-    if key not in presets:
-        return make_response(json.dumps({'error': 'Preset not found'}), 404)
-
-    config['active_preset'] = key
-    save_config(config)
-    resp = make_response(json.dumps({'status': 'ok', 'active_preset': key}))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
-
 # ============================================================
 # Routes: Admin Utilities
 # ============================================================
+
+@app.route('/admin/project-keys', methods=['GET'])
+@require_dataiku_auth
+def list_project_keys():
+    """List all project keys for autocomplete."""
+    try:
+        keys = dataiku.api_client().list_project_keys()
+        resp = make_response(json.dumps(keys))
+        resp.headers['Content-Type'] = 'application/json'
+        return resp
+    except Exception as e:
+        logger.error(f"Error listing project keys: {e}")
+        return make_response(json.dumps([]), 200)
 
 @app.route('/admin/agents', methods=['GET'])
 @require_dataiku_auth
@@ -1128,17 +1242,42 @@ def discover_oauth():
 @app.route('/admin/health')
 @require_dataiku_auth
 def health():
-    """Health check endpoint."""
+    """Health check endpoint with per-server status."""
     config = get_config()
-    preset = get_active_preset(config)
+    servers = config.get('servers', {})
+    base_url = get_base_url()
+
+    server_statuses = {}
+    for name, server in servers.items():
+        preset_key = server.get('active_preset', '')
+        preset = config.get('presets', {}).get(preset_key, {})
+        agent = server.get('agent', {})
+        server_statuses[name] = {
+            'display_name': server.get('display_name', name),
+            'oauth_enabled': preset.get('oauth_enabled', False),
+            'oauth_mode': preset.get('oauth_mode', ''),
+            'preset_name': preset.get('name', ''),
+            'agent_configured': bool(agent.get('project_key') and agent.get('tool_ids')),
+            'mcp_url': base_url + '/servers/' + name + '/mcp',
+        }
+
+    any_configured = any(s['agent_configured'] for s in server_statuses.values()) if server_statuses else False
+    any_oauth = any(s['oauth_enabled'] for s in server_statuses.values()) if server_statuses else False
+
     status = {
         'status': 'running',
-        'oauth_enabled': preset.get('oauth_enabled', False),
-        'oauth_mode': preset.get('oauth_mode', 'builtin'),
-        'agent_configured': bool(config.get('agent', {}).get('project_key')),
-        'active_preset': config.get('active_preset', ''),
-        'preset_name': preset.get('name', ''),
+        'server_count': len(servers),
+        'servers': server_statuses,
+        'any_agent_configured': any_configured,
+        'any_oauth_enabled': any_oauth,
     }
     resp = make_response(json.dumps(status))
+    resp.headers['Content-Type'] = 'application/json'
+    return resp
+
+@app.route('/admin/debug-log')
+@require_dataiku_auth
+def get_debug_log():
+    resp = make_response(json.dumps(_debug_log, indent=2))
     resp.headers['Content-Type'] = 'application/json'
     return resp

@@ -24,6 +24,7 @@ h3.section-label { font-size: 13px; font-weight: 500; color: #374151; margin: 16
 .form-group input[type="text"], .form-group input[type="url"], .form-group input[type="password"] {
     width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; }
 .form-group input:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,0.1); }
+.form-group input:disabled { background: #f1f5f9; color: #64748b; }
 .form-group select { width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; background: #fff; }
 .form-group select:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,0.1); }
 .help { font-size: 12px; color: #6b7280; margin-top: 2px; display: block; }
@@ -36,7 +37,7 @@ h3.section-label { font-size: 13px; font-weight: 500; color: #374151; margin: 16
 .btn-small:hover { background: #e2e8f0; }
 
 .url-box { display: flex; align-items: center; gap: 8px; background: #f8fafc; padding: 12px; border-radius: 6px; border: 1px solid #e2e8f0; }
-.url-box code { flex: 1; font-size: 13px; word-break: break-all; }
+.url-box code { flex: 1; font-size: 13px; word-break: break-all; user-select: all; }
 pre { background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: 6px; font-size: 13px; overflow-x: auto; white-space: pre-wrap; }
 
 .tools-list { margin-top: 12px; }
@@ -46,12 +47,7 @@ pre { background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: 6px; fo
 .tool-item .tool-name { font-weight: 500; font-size: 14px; }
 .tool-item .tool-type { font-size: 12px; color: #6b7280; }
 
-#health-info { font-size: 14px; }
-#health-info div { margin-bottom: 4px; }
-#save-status, #save-status-agent { margin-left: 12px; font-size: 13px; }
-ol.steps { padding-left: 20px; margin: 12px 0; }
-ol.steps li { margin-bottom: 8px; font-size: 14px; line-height: 1.5; }
-ol.steps code { background: #f1f5f9; padding: 2px 6px; border-radius: 3px; font-size: 13px; }
+#save-status, #save-status-server { margin-left: 12px; font-size: 13px; }
 .card p { font-size: 14px; line-height: 1.5; margin-bottom: 8px; }
 
 /* Mode selector cards */
@@ -79,10 +75,6 @@ ol.steps code { background: #f1f5f9; padding: 2px 6px; border-radius: 3px; font-
 }
 .info-box code { background: #dbeafe; padding: 1px 5px; border-radius: 3px; }
 
-/* Step checkmarks */
-ol.steps li.step-done { color: #166534; }
-ol.steps li.step-done::marker { content: "\2713  "; }
-
 /* Preset list */
 .presets-header {
     display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 12px;
@@ -104,6 +96,20 @@ ol.steps li.step-done::marker { content: "\2713  "; }
 .preset-key-label { font-size: 11px; color: #9ca3af; font-family: monospace; }
 .preset-row-actions { display: flex; gap: 6px; margin-left: 12px; flex-shrink: 0; }
 
+/* Server list */
+.server-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 16px; border: 1px solid #e2e8f0; border-radius: 8px;
+    margin-bottom: 8px; background: #f8fafc; transition: border-color 0.15s;
+}
+.server-row:hover { border-color: #cbd5e1; }
+.server-info { flex: 1; min-width: 0; }
+.server-name { font-size: 15px; font-weight: 600; color: #1e293b; }
+.server-meta { margin-top: 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.server-meta .badge { font-size: 11px; padding: 2px 8px; }
+.server-url-label { font-size: 11px; color: #9ca3af; font-family: monospace; word-break: break-all; }
+.server-row-actions { display: flex; gap: 6px; margin-left: 12px; flex-shrink: 0; }
+
 /* Editor */
 .editor-header {
     display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;
@@ -119,54 +125,12 @@ ol.steps li.step-done::marker { content: "\2713  "; }
 .btn-danger:hover:not(:disabled) { background: #fecaca; }
 .btn-danger:disabled { opacity: 0.5; cursor: default; }
 
-/* Hero card */
-.hero-card { padding: 24px; }
-.hero-url-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; margin-bottom: 6px; }
-.url-box-lg { padding: 14px 16px; }
-.url-box-lg code { font-size: 14px; }
+/* URL boxes */
 .url-box-sm { margin-top: 8px; }
 
-/* Status pills row */
-.status-row { display: flex; gap: 10px; margin-top: 16px; }
-.status-pill {
-    display: flex; align-items: center; gap: 6px;
-    padding: 6px 12px; border-radius: 20px; font-size: 13px;
-    background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0;
-}
-.status-dot {
-    width: 8px; height: 8px; border-radius: 50%; background: #cbd5e1; flex-shrink: 0;
-}
-.status-pill.pill-ok { background: #f0fdf4; color: #166534; border-color: #bbf7d0; }
-.status-pill.pill-ok .status-dot { background: #22c55e; }
-.status-pill.pill-off { background: #f8fafc; color: #94a3b8; border-color: #e2e8f0; }
-.status-pill.pill-off .status-dot { background: #cbd5e1; }
-
-/* Setup checklist */
-.checklist { margin-top: 8px; }
-.checklist-item {
-    display: flex; align-items: flex-start; gap: 10px;
-    padding: 10px 0; border-bottom: 1px solid #f1f5f9;
-}
-.checklist-item:last-child { border-bottom: none; }
-.check-icon {
-    width: 20px; height: 20px; border-radius: 50%; border: 2px solid #d1d5db;
-    flex-shrink: 0; margin-top: 1px; position: relative;
-}
-.checklist-item.check-done .check-icon {
-    background: #22c55e; border-color: #22c55e;
-}
-.checklist-item.check-done .check-icon::after {
-    content: ''; position: absolute; top: 3px; left: 6px;
-    width: 5px; height: 9px; border: solid #fff; border-width: 0 2px 2px 0;
-    transform: rotate(45deg);
-}
-.checklist-item.check-done { color: #6b7280; }
-.checklist-item strong { font-size: 14px; display: block; }
-.checklist-item .help { margin-top: 2px; }
-
-/* Client tabs (within Connection Info) */
+/* Client tabs (within connection info sections) */
 .client-tabs {
-    display: flex; gap: 4px; border-bottom: 2px solid #e2e8f0; margin-bottom: 16px;
+    display: flex; gap: 4px; border-bottom: 2px solid #e2e8f0; margin-bottom: 16px; margin-top: 12px;
 }
 .client-tab {
     padding: 8px 14px; border: none; background: none; cursor: pointer;
@@ -185,3 +149,7 @@ ol.steps li.step-done::marker { content: "\2713  "; }
 .instructions li:last-child { margin-bottom: 0; }
 .instructions strong { color: #1e293b; }
 .instructions-intro { font-size: 14px; margin-bottom: 8px; color: #374151; }
+
+/* Debug log */
+.debug-summary { cursor: pointer; padding: 4px 0; }
+.debug-summary::-webkit-details-marker { margin-right: 8px; }
