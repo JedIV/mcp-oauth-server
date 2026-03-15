@@ -119,6 +119,17 @@
             </div>
         </div>
 
+            <!-- Debug Log (collapsible) -->
+            <details class="card">
+                <summary class="debug-summary"><h2 style="display:inline;">Debug Log</h2> <span class="help" style="display:inline; margin-left:8px;">Recent backend events</span></summary>
+                <div id="debug-log-controls" style="margin:12px 0 8px; display:flex; gap:8px;">
+                    <button onclick="refreshDebugLog()" class="btn-small">Refresh</button>
+                    <span id="debug-log-count" class="help" style="line-height:32px;"></span>
+                </div>
+                <pre id="debug-log-content" style="max-height:300px; overflow-y:auto; font-size:12px;">Click Refresh to load.</pre>
+            </details>
+        </div>
+
         <!-- OAuth Presets Tab -->
         <div id="tab-oauth" class="tab-content">
             <div class="card">

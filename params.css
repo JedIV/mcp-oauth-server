@@ -149,3 +149,7 @@ pre { background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: 6px; fo
 .instructions li:last-child { margin-bottom: 0; }
 .instructions strong { color: #1e293b; }
 .instructions-intro { font-size: 14px; margin-bottom: 8px; color: #374151; }
+
+/* Debug log */
+.debug-summary { cursor: pointer; padding: 4px 0; }
+.debug-summary::-webkit-details-marker { margin-right: 8px; }

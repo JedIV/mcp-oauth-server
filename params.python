@@ -143,11 +143,7 @@ def debug(msg):
         _debug_log.pop(0)
     logger.info(msg)
 
-@app.route('/admin/debug-log')
-def get_debug_log():
-    resp = make_response(json.dumps(_debug_log, indent=2))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
+# debug-log route registered after require_dataiku_auth is defined (see bottom of admin section)
 
 # ============================================================
 # CORS handling
@@ -1276,5 +1272,12 @@ def health():
         'any_oauth_enabled': any_oauth,
     }
     resp = make_response(json.dumps(status))
+    resp.headers['Content-Type'] = 'application/json'
+    return resp
+
+@app.route('/admin/debug-log')
+@require_dataiku_auth
+def get_debug_log():
+    resp = make_response(json.dumps(_debug_log, indent=2))
     resp.headers['Content-Type'] = 'application/json'
     return resp

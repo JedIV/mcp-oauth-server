@@ -705,6 +705,30 @@ async function seedDefaultPresets() {
 }
 
 // ============================================================
+// Debug Log
+// ============================================================
+async function refreshDebugLog() {
+    try {
+        const resp = await fetch(backendUrl + 'admin/debug-log');
+        const logs = await resp.json();
+        const content = document.getElementById('debug-log-content');
+        const count = document.getElementById('debug-log-count');
+        count.textContent = logs.length + ' entries';
+        if (logs.length === 0) {
+            content.textContent = '(empty)';
+            return;
+        }
+        content.textContent = logs.map(e => {
+            const ts = e.t ? new Date(e.t * 1000).toLocaleTimeString() : '--';
+            return `[${ts}] ${e.msg}`;
+        }).join('\n');
+        content.scrollTop = content.scrollHeight;
+    } catch (e) {
+        document.getElementById('debug-log-content').textContent = 'Error: ' + e.message;
+    }
+}
+
+// ============================================================
 // Project key autocomplete
 // ============================================================
 async function loadProjectKeys() {
@@ -719,6 +743,7 @@ async function loadProjectKeys() {
 }
 
 // Expose functions (Dataiku wraps JS in IIFE)
+window.refreshDebugLog = refreshDebugLog;
 window.copyServerUrl = copyServerUrl;
 window.copyServerCmd = copyServerCmd;
 window.discoverEndpoints = discoverEndpoints;
