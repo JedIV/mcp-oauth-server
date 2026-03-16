@@ -62,82 +62,14 @@ def is_valid_server_name(name):
     return bool(SERVER_NAME_RE.match(name))
 
 def get_config():
-    """Load MCP OAuth config from project variables, auto-migrating to v2 format."""
+    """Load MCP OAuth config from project variables."""
     try:
         project = dataiku.api_client().get_default_project()
         variables = project.get_variables()
-        config = variables.get('standard', {}).get('mcp_oauth_config', {})
-
-        # Auto-migrate v1 (flat/presets) to v2 (servers)
-        if config.get('config_version') != 2:
-            config = _migrate_to_v2(config)
-            if 'standard' not in variables:
-                variables['standard'] = {}
-            variables['standard']['mcp_oauth_config'] = config
-            project.set_variables(variables)
-            logger.info("Auto-migrated config to v2 (multi-server)")
-
-        return config
+        return variables.get('standard', {}).get('mcp_oauth_config', {}) or {'presets': {}, 'servers': {}}
     except Exception as e:
         logger.error(f"Error loading config: {e}")
-        return {'config_version': 2, 'presets': {}, 'servers': {}}
-
-def _migrate_to_v2(config):
-    """Migrate any older config format to v2 with servers dict."""
-    # First ensure presets exist (handle pre-preset flat config)
-    if 'presets' not in config and config.get('oauth_mode'):
-        config = _migrate_flat_to_presets(config)
-
-    presets = config.get('presets', {})
-    active_preset = config.get('active_preset', '')
-    agent = config.get('agent', {})
-
-    new_config = {
-        'config_version': 2,
-        'presets': presets,
-        'servers': {},
-    }
-
-    # Preserve base_url if set
-    if config.get('base_url'):
-        new_config['base_url'] = config['base_url']
-
-    # If there was an agent or active preset, create a 'default' server
-    if agent or active_preset:
-        new_config['servers']['default'] = {
-            'display_name': 'Default',
-            'active_preset': active_preset,
-            'agent': agent,
-        }
-
-    return new_config
-
-def _migrate_flat_to_presets(config):
-    """Migrate a flat config (pre-presets) into the preset structure."""
-    mode = config.get('oauth_mode', 'builtin')
-    preset_key = mode + '-default'
-
-    preset_data = {'name': _default_preset_name(mode)}
-    for field in PRESET_FIELDS:
-        if field in config:
-            preset_data[field] = config[field]
-
-    new_config = {}
-    for k, v in config.items():
-        if k not in PRESET_FIELDS:
-            new_config[k] = v
-    new_config['presets'] = {preset_key: preset_data}
-    new_config['active_preset'] = preset_key
-
-    return new_config
-
-def _default_preset_name(mode):
-    names = {
-        'builtin': 'Built-in (Testing)',
-        'external': 'External IdP',
-        'direct': 'Direct OAuth 2.1',
-    }
-    return names.get(mode, mode)
+        return {'presets': {}, 'servers': {}}
 
 def save_config(config):
     """Save MCP OAuth config to project variables."""
@@ -1036,7 +968,7 @@ def save_admin_config():
     existing = get_config()
 
     # Only allow updating base_url — presets/servers have dedicated endpoints
-    PROTECTED_KEYS = {'presets', 'servers', 'config_version'}
+    PROTECTED_KEYS = {'presets', 'servers'}
     for key in PROTECTED_KEYS:
         if key in new_config:
             return json_response({'error': 'Cannot modify ' + key + ' through this endpoint; use dedicated CRUD endpoints'}, 400)
@@ -1048,7 +980,6 @@ def save_admin_config():
         if key in new_config:
             merged[key] = new_config[key]
 
-    merged['config_version'] = 2
     save_config(merged)
     return json_response({'status': 'ok'})
 
