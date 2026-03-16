@@ -129,9 +129,9 @@ Older config formats (v1 flat or preset-only) are automatically migrated to v2 o
 - **Flask** (not FastAPI) — works with Dataiku's built-in webapp framework
 - **Multiple servers** — each server gets its own endpoint path, tools, and OAuth preset, while presets are shared globally
 - **OAuth proxy pattern** — for IdPs like Entra ID that don't support MCP's Dynamic Client Registration, the webapp acts as a proxy: OIDC discovery points to self, `/oauth/*` endpoints forward to the external IdP while shimming in DCR support
-- **JWT validation without PyJWT** — stdlib `base64` decode + claims check. Safe because we proxy the token exchange ourselves, so the token provenance is trusted
+- **Token validation via introspection** — external/direct mode tokens are validated server-side by calling the IdP's introspection endpoint (RFC 7662). No local JWT decode — the IdP is the authority. This prevents token forgery entirely.
 - **Config in project variables** — no external database needed; config persists across restarts
-- **Admin auth via Dataiku session** — admin endpoints check for DSS session cookies, `X-DKU-AuthenticatedUser` header, or API key
+- **Admin auth via API key** — admin endpoints require a valid Dataiku API key (`X-DKU-APIKey` header), validated server-side against DSS
 - **Server names as URL slugs** — must be lowercase alphanumeric with hyphens, used directly in endpoint URLs
 
 ## Gotchas

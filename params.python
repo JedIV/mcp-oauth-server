@@ -8,6 +8,9 @@ import requests as http_requests
 from functools import wraps
 from flask import request, make_response, Response
 
+import jwt as pyjwt
+from jwt import PyJWKClient
+
 logger = logging.getLogger(__name__)
 
 # ============================================================
@@ -165,72 +168,146 @@ def mcp_options(server_name):
 # Token Validation
 # ============================================================
 
-_jwks_cache = {'keys': None, 'fetched_at': 0}
+_oidc_metadata_cache = {}  # issuer_url -> (metadata_dict, expiry_time)
+_jwks_client_cache = {}    # jwks_uri -> PyJWKClient
 
-def get_jwks(jwks_uri):
-    """Fetch and cache JWKS keys from the OAuth provider."""
+def _get_oidc_metadata(issuer_url):
+    """Fetch and cache OIDC discovery metadata for an issuer."""
     now = time.time()
-    if _jwks_cache['keys'] and (now - _jwks_cache['fetched_at']) < 3600:
-        return _jwks_cache['keys']
-    try:
-        resp = http_requests.get(jwks_uri, timeout=10)
-        if resp.status_code == 200:
-            _jwks_cache['keys'] = resp.json()
-            _jwks_cache['fetched_at'] = now
-            return _jwks_cache['keys']
-    except Exception as e:
-        logger.error(f"JWKS fetch error: {e}")
-    return _jwks_cache.get('keys')
+    cached = _oidc_metadata_cache.get(issuer_url)
+    if cached and cached[1] > now:
+        return cached[0]
 
-def validate_token_jwt(token, preset):
-    """Validate a JWT token by decoding and checking claims."""
+    base = issuer_url.rstrip('/')
+    for suffix in ['/.well-known/openid-configuration', '/.well-known/oauth-authorization-server']:
+        try:
+            resp = http_requests.get(base + suffix, timeout=10)
+            if resp.status_code == 200:
+                metadata = resp.json()
+                _oidc_metadata_cache[issuer_url] = (metadata, now + 3600)
+                return metadata
+        except Exception:
+            continue
+    return None
+
+def _discover_introspection_endpoint(preset):
+    """Discover the introspection endpoint from OIDC metadata if not explicitly configured."""
+    if preset.get('introspection_endpoint'):
+        return preset['introspection_endpoint']
+    auth_server = preset.get('authorization_server', '').rstrip('/')
+    if not auth_server:
+        return None
+    metadata = _get_oidc_metadata(auth_server)
+    return metadata.get('introspection_endpoint') if metadata else None
+
+def _validate_token_introspection(token, preset):
+    """Validate a token via the IdP's introspection endpoint (RFC 7662)."""
+    introspection_url = _discover_introspection_endpoint(preset)
     client_id = preset.get('client_id', '')
+    client_secret = preset.get('client_secret', '')
+
+    if not introspection_url or not client_id:
+        debug("TOKEN INTROSPECTION: No introspection endpoint or client_id configured")
+        return None
+
+    data = {'token': token, 'client_id': client_id}
+    if client_secret:
+        data['client_secret'] = client_secret
 
     try:
-        parts = token.split('.')
-        if len(parts) != 3:
-            debug("JWT VALIDATION: Not a valid JWT (wrong number of parts)")
+        debug(f"TOKEN INTROSPECTION: Calling {introspection_url}")
+        resp = http_requests.post(
+            introspection_url,
+            data=data,
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            timeout=10
+        )
+        if resp.status_code != 200:
+            debug(f"TOKEN INTROSPECTION: Returned {resp.status_code}: {resp.text[:200]}")
             return None
 
-        payload_b64 = parts[1]
-        payload_b64 += '=' * (4 - len(payload_b64) % 4)
-        payload_json = base64.urlsafe_b64decode(payload_b64)
-        claims = json.loads(payload_json)
-
-        debug(f'JWT CLAIMS: iss={claims.get("iss")} aud={claims.get("aud")} sub={claims.get("sub")} scp={claims.get("scp")} exp={claims.get("exp")}')
-
-        exp = claims.get('exp', 0)
-        if exp < time.time():
-            debug("JWT VALIDATION: Token expired")
+        result = resp.json()
+        if not result.get('active', False):
+            debug("TOKEN INTROSPECTION: Token is not active")
             return None
+        debug(f"TOKEN INTROSPECTION: SUCCESS sub={result.get('sub')} scope={result.get('scp', result.get('scope'))}")
+        return result
+    except Exception as e:
+        debug(f"TOKEN INTROSPECTION ERROR: {e}")
+        return None
 
-        aud = claims.get('aud', '')
-        valid_audiences = [client_id, f'api://{client_id}']
-        if aud not in valid_audiences:
-            debug(f'JWT VALIDATION: Audience mismatch: got {aud}, expected one of {valid_audiences}')
-            return None
+def _validate_token_jwt(token, preset):
+    """Validate a JWT access token using JWKS (PyJWT + cryptography)."""
+    auth_server = preset.get('authorization_server', '').rstrip('/')
+    if not auth_server:
+        debug("JWT VALIDATION: No authorization_server configured")
+        return None
 
-        iss = claims.get('iss', '')
-        if iss and 'windows.net' not in iss and 'microsoftonline.com' not in iss:
-            auth_server = preset.get('authorization_server', '').rstrip('/')
-            if auth_server and not iss.startswith(auth_server):
-                debug(f'JWT VALIDATION: Issuer mismatch: got {iss}')
-                return None
+    metadata = _get_oidc_metadata(auth_server)
+    if not metadata:
+        debug(f"JWT VALIDATION: Could not fetch OIDC metadata from {auth_server}")
+        return None
 
-        debug(f'JWT VALIDATION: SUCCESS sub={claims.get("sub")} name={claims.get("name")}')
+    jwks_uri = metadata.get('jwks_uri')
+    issuer = metadata.get('issuer')
+    if not jwks_uri:
+        debug("JWT VALIDATION: No jwks_uri in OIDC metadata")
+        return None
+
+    try:
+        if jwks_uri not in _jwks_client_cache:
+            _jwks_client_cache[jwks_uri] = PyJWKClient(jwks_uri, cache_keys=True, lifespan=3600)
+        signing_key = _jwks_client_cache[jwks_uri].get_signing_key_from_jwt(token)
+
+        decode_kwargs = {
+            'key': signing_key.key,
+            'algorithms': ['RS256', 'RS384', 'RS512', 'ES256', 'ES384', 'ES512'],
+            'options': {'verify_exp': True},
+        }
+        # Entra ID may issue v1 tokens (issuer: sts.windows.net/{tenant})
+        # even when OIDC discovery reports the v2 issuer (login.microsoftonline.com/{tenant}/v2.0).
+        # Accept both formats so issuer validation still works.
+        if issuer:
+            accepted_issuers = [issuer]
+            # If v2 issuer, also accept the v1 equivalent
+            import re as _re
+            m = _re.match(r'https://login\.microsoftonline\.com/([^/]+)/v2\.0', issuer)
+            if m:
+                accepted_issuers.append(f'https://sts.windows.net/{m.group(1)}/')
+            decode_kwargs['issuer'] = accepted_issuers
+        client_id = preset.get('client_id', '')
+        if client_id:
+            # Entra v1 tokens use "api://{client_id}" as audience, v2 uses the client_id directly
+            decode_kwargs['audience'] = [client_id, f'api://{client_id}']
+
+        claims = pyjwt.decode(token, **decode_kwargs)
+
+        debug(f"JWT VALIDATION: SUCCESS sub={claims.get('sub')} aud={claims.get('aud')} "
+              f"scp={claims.get('scp', claims.get('scope'))}")
         return {
             'active': True,
-            'client_id': claims.get('azp', claims.get('appid', '')),
-            'scope': claims.get('scp', ''),
             'sub': claims.get('sub', claims.get('oid', '')),
-            'name': claims.get('name', ''),
+            'client_id': claims.get('azp', claims.get('appid', client_id)),
+            'scope': claims.get('scp', claims.get('scope', '')),
+            'claims': claims,
         }
+    except pyjwt.ExpiredSignatureError:
+        debug("JWT VALIDATION: Token expired")
+        return None
+    except pyjwt.InvalidAudienceError as e:
+        debug(f"JWT VALIDATION: Invalid audience — {e}")
+        return None
+    except pyjwt.InvalidIssuerError as e:
+        debug(f"JWT VALIDATION: Invalid issuer — {e}")
+        return None
     except Exception as e:
-        debug(f'JWT VALIDATION ERROR: {type(e).__name__}: {e}')
+        debug(f"JWT VALIDATION ERROR: {type(e).__name__}: {e}")
         return None
 
 def validate_token(token, server_name):
-    """Validate Bearer token for a specific server. Supports built-in OAuth, JWT, and introspection."""
+    """Validate Bearer token for a specific server.
+    Built-in mode: check in-memory store.
+    External/Direct: try introspection first, then JWKS JWT verification."""
     config = get_config()
     preset = get_active_preset(config, server_name)
     mode = preset.get('oauth_mode', 'builtin')
@@ -244,45 +321,14 @@ def validate_token(token, server_name):
                 return {'active': True, 'client_id': td['client_id'], 'scope': td['scope'], 'sub': td['user']}
         return None
 
-    if mode == 'external':
-        if token.count('.') == 2:
-            result = validate_token_jwt(token, preset)
-            if result is not None:
-                return result
-
-    introspection_url = preset.get('introspection_endpoint', '')
-    client_id = preset.get('client_id', '')
-    client_secret = preset.get('client_secret', '')
-
-    if not introspection_url or not client_id:
-        if mode == 'external':
-            logger.warning("External mode: JWT validation failed and no introspection endpoint configured")
-        else:
-            logger.warning("Direct mode: no introspection endpoint configured")
-        return None
-
-    data = {'token': token, 'client_id': client_id}
-    if client_secret:
-        data['client_secret'] = client_secret
-
-    try:
-        resp = http_requests.post(
-            introspection_url,
-            data=data,
-            headers={'Content-Type': 'application/x-www-form-urlencoded'},
-            timeout=10
-        )
-        if resp.status_code != 200:
-            logger.error(f"Introspection returned {resp.status_code}")
-            return None
-
-        result = resp.json()
-        if not result.get('active', False):
-            return None
+    # External and Direct modes: try introspection first (preferred, RFC 7662)
+    result = _validate_token_introspection(token, preset)
+    if result:
         return result
-    except Exception as e:
-        logger.error(f"Token validation error: {e}")
-        return None
+
+    # Fallback: JWKS-based JWT signature verification (for Entra ID, etc.)
+    debug("TOKEN VALIDATION: Introspection unavailable, trying JWKS JWT verification")
+    return _validate_token_jwt(token, preset)
 
 def get_base_url():
     """Get the externally-reachable base URL for this webapp."""
@@ -300,9 +346,11 @@ def require_bearer_auth(f):
         preset = get_active_preset(config, server_name)
 
         if not preset.get('oauth_enabled', False):
+            debug(f'MCP AUTH: OAuth disabled for server={server_name}, passing through')
             return f(*args, **kwargs)
 
         auth_header = request.headers.get('Authorization', '')
+        debug(f'MCP AUTH: server={server_name} method={request.method} has_bearer={auth_header.startswith("Bearer ")}')
         if not auth_header.startswith('Bearer '):
             base_url = get_base_url()
             resp = make_response('', 401)
@@ -631,9 +679,11 @@ def oauth_register(server_name):
 
     if mode == 'external':
         body = request.get_json(force=True)
+        # Return client_id but NOT the real client_secret — the token proxy
+        # injects credentials server-side, so clients don't need the secret.
         client_data = {
             'client_id': preset.get('client_id', ''),
-            'client_secret': preset.get('client_secret', ''),
+            'client_secret': 'proxy-managed',
             'client_name': body.get('client_name', 'MCP Client'),
             'redirect_uris': body.get('redirect_uris', []),
             'grant_types': body.get('grant_types', ['authorization_code']),
@@ -731,6 +781,13 @@ def oauth_authorize_submit(server_name):
     if OAUTH_TEST_USERS.get(username) != password:
         return make_response('Invalid credentials', 401)
 
+    # Validate redirect_uri against client's registered URIs
+    if client_id not in oauth_clients:
+        return make_response('Unknown client', 400)
+    registered_uris = oauth_clients[client_id].get('redirect_uris', [])
+    if redirect_uri not in registered_uris:
+        return make_response('Invalid redirect_uri — not registered for this client', 400)
+
     code = secrets.token_urlsafe(32)
     oauth_auth_codes[code] = {
         'client_id': client_id,
@@ -768,9 +825,24 @@ def oauth_token(server_name):
             debug(f'TOKEN PROXY: Failed to discover token endpoint: {e}')
             return make_response(json.dumps({'error': 'server_error', 'error_description': 'Could not discover token endpoint'}), 500)
 
-        form_data = request.form.to_dict() if request.form else {}
+        # Some clients (e.g. ChatGPT) send token requests as JSON instead of form-encoded
+        if request.content_type and 'json' in request.content_type:
+            form_data = request.get_json(force=True)
+        elif request.form:
+            form_data = request.form.to_dict()
+        else:
+            # Try parsing body as JSON fallback
+            try:
+                form_data = request.get_json(force=True) or {}
+            except Exception:
+                form_data = {}
         form_data.pop('resource', None)
-        debug(f'TOKEN PROXY: Forwarding to {ext_token_url}')
+        # Always inject the real client credentials — clients may send the placeholder
+        # "proxy-managed" secret from DCR, or omit credentials entirely (ChatGPT)
+        form_data['client_id'] = preset.get('client_id', '')
+        if preset.get('client_secret'):
+            form_data['client_secret'] = preset.get('client_secret', '')
+        debug(f'TOKEN PROXY: Forwarding to {ext_token_url} (content_type={request.content_type}, keys={list(form_data.keys())})')
 
         ext_resp = http_requests.post(
             ext_token_url,
@@ -778,6 +850,9 @@ def oauth_token(server_name):
             headers={'Content-Type': 'application/x-www-form-urlencoded'},
             timeout=15
         )
+        debug(f'TOKEN PROXY: Response status={ext_resp.status_code}')
+        if ext_resp.status_code != 200:
+            debug(f'TOKEN PROXY: Error response: {ext_resp.text[:500]}')
 
         resp = make_response(ext_resp.text, ext_resp.status_code)
         resp.headers['Content-Type'] = ext_resp.headers.get('Content-Type', 'application/json')
@@ -945,34 +1020,25 @@ def mcp_delete(server_name):
 # ============================================================
 
 def require_dataiku_auth(f):
-    """Require valid Dataiku session for admin endpoints."""
+    """Require valid Dataiku API key for admin endpoints.
+    The webapp UI passes the user's API key via X-DKU-APIKey header."""
     @wraps(f)
     def decorated(*args, **kwargs):
+        import dataikuapi
+
         dku_api_key = request.headers.get('X-DKU-APIKey', '')
-        if dku_api_key:
-            try:
-                import dataikuapi
-                test_client = dataikuapi.DSSClient(
-                    dataiku.api_client().host if hasattr(dataiku.api_client(), 'host') else get_config().get('base_url', '').split('/web-apps-backends')[0],
-                    api_key=dku_api_key
-                )
-                test_client.list_project_keys()
-                return f(*args, **kwargs)
-            except Exception:
-                return make_response(json.dumps({'error': 'Invalid API key'}), 401)
+        if not dku_api_key:
+            return make_response(json.dumps({'error': 'Admin endpoints require Dataiku API key (X-DKU-APIKey header)'}), 401,
+                                 {'Content-Type': 'application/json'})
 
-        if request.headers.get('X-DKU-AuthenticatedUser'):
+        try:
+            dss_url = dataiku.api_client().host
+            test_client = dataikuapi.DSSClient(dss_url, api_key=dku_api_key)
+            test_client.list_project_keys()
             return f(*args, **kwargs)
-
-        referer = request.headers.get('Referer', '')
-        if '/projects/' in referer and '/webapps/' in referer:
-            return f(*args, **kwargs)
-
-        cookie = request.headers.get('Cookie', '')
-        if 'dss_access_token_' in cookie or 'X-DKU-Flask-User' in cookie:
-            return f(*args, **kwargs)
-
-        return make_response(json.dumps({'error': 'Admin endpoints require Dataiku authentication'}), 401)
+        except Exception:
+            return make_response(json.dumps({'error': 'Invalid API key'}), 401,
+                                 {'Content-Type': 'application/json'})
     return decorated
 
 @app.route('/admin/config', methods=['GET'])

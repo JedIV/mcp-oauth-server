@@ -10,6 +10,16 @@ let editingServerName = ''; // name being edited, or '__new__'
 // Derive the public base URL
 const autoBaseUrl = window.location.origin + backendUrl.replace(/\/$/, '');
 
+// Authenticated fetch wrapper — passes user's Dataiku API key to admin endpoints
+function adminFetch(url, options) {
+    options = options || {};
+    options.headers = options.headers || {};
+    if (typeof dataiku !== 'undefined' && dataiku.defaultAPIKey) {
+        options.headers['X-DKU-APIKey'] = dataiku.defaultAPIKey;
+    }
+    return fetch(url, options);
+}
+
 // ============================================================
 // Tab switching
 // ============================================================
@@ -74,7 +84,7 @@ function showSaveStatus(msg, color) {
 
 async function loadServers() {
     try {
-        const resp = await fetch(backendUrl + 'admin/servers');
+        const resp = await adminFetch(backendUrl + 'admin/servers');
         serversData = await resp.json();
         renderServerList();
     } catch (e) {
@@ -218,7 +228,7 @@ async function loadServerAgentTools(preCheckedIds) {
     }
 
     try {
-        const resp = await fetch(backendUrl + 'admin/agents?project_key=' + encodeURIComponent(projectKey));
+        const resp = await adminFetch(backendUrl + 'admin/agents?project_key=' + encodeURIComponent(projectKey));
         const tools = await resp.json();
 
         if (tools.length === 0) {
@@ -268,7 +278,7 @@ async function saveServer() {
     };
 
     try {
-        const resp = await fetch(backendUrl + 'admin/servers', {
+        const resp = await adminFetch(backendUrl + 'admin/servers', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ name, server_data: serverData })
@@ -296,7 +306,7 @@ async function deleteServer(name) {
     if (!confirm('Delete server "' + (server ? server.display_name : name) + '"? This removes the MCP endpoint.')) return;
 
     try {
-        const resp = await fetch(backendUrl + 'admin/servers/' + encodeURIComponent(name), {
+        const resp = await adminFetch(backendUrl + 'admin/servers/' + encodeURIComponent(name), {
             method: 'DELETE'
         });
         const result = await resp.json();
@@ -347,7 +357,7 @@ document.addEventListener('click', (e) => {
 
 async function loadPresets() {
     try {
-        const resp = await fetch(backendUrl + 'admin/presets');
+        const resp = await adminFetch(backendUrl + 'admin/presets');
         presetsData = await resp.json();
         renderPresetList();
     } catch (e) {
@@ -515,7 +525,7 @@ async function savePreset() {
     }
 
     try {
-        const resp = await fetch(backendUrl + 'admin/presets', {
+        const resp = await adminFetch(backendUrl + 'admin/presets', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ key, preset_data: presetData })
@@ -544,7 +554,7 @@ async function deletePreset(key) {
     if (!confirm('Delete preset "' + (preset ? preset.name : key) + '"?')) return;
 
     try {
-        const resp = await fetch(backendUrl + 'admin/presets/' + encodeURIComponent(key), {
+        const resp = await adminFetch(backendUrl + 'admin/presets/' + encodeURIComponent(key), {
             method: 'DELETE'
         });
         const result = await resp.json();
@@ -580,7 +590,7 @@ async function discoverEndpoints(mode) {
     }
 
     try {
-        const resp = await fetch(backendUrl + 'admin/discover', {
+        const resp = await adminFetch(backendUrl + 'admin/discover', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({issuer_url: issuer})
@@ -608,7 +618,7 @@ async function discoverEndpoints(mode) {
 
 async function refreshHealth() {
     try {
-        const healthResp = await fetch(backendUrl + 'admin/health');
+        const healthResp = await adminFetch(backendUrl + 'admin/health');
         const health = await healthResp.json();
         updateStatusBadge(health);
     } catch (e) {
@@ -644,8 +654,8 @@ function updateStatusBadge(health) {
 async function init() {
     try {
         const [configResp, healthResp] = await Promise.all([
-            fetch(backendUrl + 'admin/config'),
-            fetch(backendUrl + 'admin/health')
+            adminFetch(backendUrl + 'admin/config'),
+            adminFetch(backendUrl + 'admin/health')
         ]);
         currentConfig = await configResp.json();
         const health = await healthResp.json();
@@ -671,7 +681,7 @@ async function init() {
 }
 
 async function seedDefaultPresets() {
-    await fetch(backendUrl + 'admin/presets', {
+    await adminFetch(backendUrl + 'admin/presets', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -685,7 +695,7 @@ async function seedDefaultPresets() {
         })
     });
 
-    await fetch(backendUrl + 'admin/presets', {
+    await adminFetch(backendUrl + 'admin/presets', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -709,7 +719,7 @@ async function seedDefaultPresets() {
 // ============================================================
 async function refreshDebugLog() {
     try {
-        const resp = await fetch(backendUrl + 'admin/debug-log');
+        const resp = await adminFetch(backendUrl + 'admin/debug-log');
         const logs = await resp.json();
         const content = document.getElementById('debug-log-content');
         const count = document.getElementById('debug-log-count');
@@ -733,7 +743,7 @@ async function refreshDebugLog() {
 // ============================================================
 async function loadProjectKeys() {
     try {
-        const resp = await fetch(backendUrl + 'admin/project-keys');
+        const resp = await adminFetch(backendUrl + 'admin/project-keys');
         const keys = await resp.json();
         const datalist = document.getElementById('project-keys-list');
         datalist.innerHTML = keys.map(k => `<option value="${k}">`).join('');
