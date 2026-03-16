@@ -1,7 +1,6 @@
 const backendUrl = getWebAppBackendUrl('');
 
 // State
-let currentConfig = {};
 let presetsData = {};       // key -> preset
 let serversData = {};       // name -> server info
 let editingPresetKey = '';  // key being edited, or '__new__'
@@ -653,11 +652,7 @@ function updateStatusBadge(health) {
 // ============================================================
 async function init() {
     try {
-        const [configResp, healthResp] = await Promise.all([
-            adminFetch(backendUrl + 'admin/config'),
-            adminFetch(backendUrl + 'admin/health')
-        ]);
-        currentConfig = await configResp.json();
+        const healthResp = await adminFetch(backendUrl + 'admin/health');
         const health = await healthResp.json();
 
         // Load presets first (needed by server editor dropdowns)

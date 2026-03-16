@@ -1,9 +1,14 @@
 import dataiku
+import dataikuapi
 import json
 import uuid
 import time
 import logging
 import re
+import hashlib
+import base64
+import secrets
+from urllib.parse import urlencode
 import requests as http_requests
 from functools import wraps
 from flask import request, make_response, Response
@@ -12,6 +17,13 @@ import jwt as pyjwt
 from jwt import PyJWKClient
 
 logger = logging.getLogger(__name__)
+
+
+def json_response(data, status=200):
+    """Return a JSON response with correct Content-Type."""
+    resp = make_response(json.dumps(data), status)
+    resp.headers['Content-Type'] = 'application/json'
+    return resp
 
 # ============================================================
 # Configuration Management (stored in project variables)
@@ -116,24 +128,21 @@ def get_server_config(config, server_name):
     """Get a server's config dict from the top-level config."""
     return config.get('servers', {}).get(server_name, {})
 
+def _strip_secret(preset):
+    """Return a preset dict with client_secret replaced by a has_client_secret flag."""
+    safe = {k: v for k, v in preset.items() if k != 'client_secret'}
+    safe['has_client_secret'] = bool(preset.get('client_secret'))
+    return safe
+
 def get_active_preset(config, server_name=None):
-    """Get the active preset dict for a server. Falls back gracefully."""
+    """Get the active preset dict for a server."""
     presets = config.get('presets', {})
     if server_name:
         server = get_server_config(config, server_name)
         active_key = server.get('active_preset', '')
-    else:
-        active_key = ''
-    if active_key and active_key in presets:
-        return presets[active_key]
-    if presets:
-        return next(iter(presets.values()))
+        if active_key and active_key in presets:
+            return presets[active_key]
     return {}
-
-def get_oauth_mode(config, server_name=None):
-    """Get the current OAuth mode from the active preset for a server."""
-    preset = get_active_preset(config, server_name)
-    return preset.get('oauth_mode', 'builtin')
 
 # ============================================================
 # Debug log (in-memory ring buffer for troubleshooting)
@@ -270,8 +279,7 @@ def _validate_token_jwt(token, preset):
         if issuer:
             accepted_issuers = [issuer]
             # If v2 issuer, also accept the v1 equivalent
-            import re as _re
-            m = _re.match(r'https://login\.microsoftonline\.com/([^/]+)/v2\.0', issuer)
+            m = re.match(r'https://login\.microsoftonline\.com/([^/]+)/v2\.0', issuer)
             if m:
                 accepted_issuers.append(f'https://sts.windows.net/{m.group(1)}/')
             decode_kwargs['issuer'] = accepted_issuers
@@ -523,9 +531,6 @@ def call_agent_tool(tool_name, arguments, server_name):
 # ============================================================
 # Built-in Mini OAuth Server (for testing)
 # ============================================================
-import hashlib
-import base64
-import secrets
 
 # In-memory stores (shared across all servers using built-in mode)
 oauth_clients = {}
@@ -596,7 +601,7 @@ input[type="text"], input[type="password"] { width: 100%%; padding: 8px 12px; bo
 def oidc_discovery(server_name):
     config = get_config()
     if server_name not in config.get('servers', {}):
-        return make_response(json.dumps({'error': 'Unknown server'}), 404)
+        return json_response({'error': 'Unknown server'}, 404)
 
     preset = get_active_preset(config, server_name)
     mode = preset.get('oauth_mode', 'builtin')
@@ -606,16 +611,11 @@ def oidc_discovery(server_name):
     if mode == 'direct':
         auth_server = preset.get('authorization_server', '').rstrip('/')
         if auth_server:
-            try:
-                ext_resp = http_requests.get(auth_server + '/.well-known/openid-configuration', timeout=10)
-                if ext_resp.status_code == 200:
-                    resp = make_response(ext_resp.text)
-                    resp.headers['Content-Type'] = 'application/json'
-                    return resp
-            except Exception as e:
-                debug(f'OIDC DISCOVERY: Failed to proxy to {auth_server}: {e}')
+            metadata = _get_oidc_metadata(auth_server)
+            if metadata:
+                return json_response(metadata)
 
-    metadata = {
+    return json_response({
         'issuer': server_base,
         'authorization_endpoint': server_base + '/oauth/authorize',
         'token_endpoint': server_base + '/oauth/token',
@@ -627,10 +627,7 @@ def oidc_discovery(server_name):
         'scopes_supported': preset.get('scopes', ['mcp:tools', 'openid']),
         'token_endpoint_auth_methods_supported': ['client_secret_post', 'none'],
         'subject_types_supported': ['public'],
-    }
-    resp = make_response(json.dumps(metadata))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
+    })
 
 @app.route('/servers/<server_name>/.well-known/oauth-authorization-server')
 def oauth_as_metadata(server_name):
@@ -641,47 +638,35 @@ def oauth_protected_resource(server_name):
     """RFC 9728 Protected Resource Metadata."""
     config = get_config()
     if server_name not in config.get('servers', {}):
-        return make_response(json.dumps({'error': 'Unknown server'}), 404)
+        return json_response({'error': 'Unknown server'}, 404)
 
     preset = get_active_preset(config, server_name)
     mode = preset.get('oauth_mode', 'builtin')
     base_url = get_base_url()
     server_base = base_url + '/servers/' + server_name
 
-    if mode == 'direct':
-        auth_server = preset.get('authorization_server', '').rstrip('/')
-        metadata = {
-            'resource': server_base + '/mcp',
-            'authorization_servers': [auth_server] if auth_server else [server_base],
-            'scopes_supported': preset.get('scopes', ['mcp:tools']),
-            'bearer_methods_supported': ['header']
-        }
-    else:
-        metadata = {
-            'resource': server_base + '/mcp',
-            'authorization_servers': [server_base],
-            'scopes_supported': preset.get('scopes', ['mcp:tools']),
-            'bearer_methods_supported': ['header']
-        }
-
-    resp = make_response(json.dumps(metadata))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
+    auth_server = preset.get('authorization_server', '').rstrip('/') if mode == 'direct' else ''
+    return json_response({
+        'resource': server_base + '/mcp',
+        'authorization_servers': [auth_server or server_base],
+        'scopes_supported': preset.get('scopes', ['mcp:tools']),
+        'bearer_methods_supported': ['header'],
+    })
 
 @app.route('/servers/<server_name>/oauth/register', methods=['POST'])
 def oauth_register(server_name):
     config = get_config()
     if server_name not in config.get('servers', {}):
-        return make_response(json.dumps({'error': 'Unknown server'}), 404)
+        return json_response({'error': 'Unknown server'}, 404)
 
     preset = get_active_preset(config, server_name)
     mode = preset.get('oauth_mode', 'builtin')
+    body = request.get_json(force=True)
 
     if mode == 'external':
-        body = request.get_json(force=True)
         # Return client_id but NOT the real client_secret — the token proxy
         # injects credentials server-side, so clients don't need the secret.
-        client_data = {
+        return json_response({
             'client_id': preset.get('client_id', ''),
             'client_secret': 'proxy-managed',
             'client_name': body.get('client_name', 'MCP Client'),
@@ -689,19 +674,15 @@ def oauth_register(server_name):
             'grant_types': body.get('grant_types', ['authorization_code']),
             'response_types': body.get('response_types', ['code']),
             'client_id_issued_at': int(time.time()),
-        }
-        resp = make_response(json.dumps(client_data))
-        resp.headers['Content-Type'] = 'application/json'
-        return resp, 201
+        }, 201)
 
     if mode == 'direct':
-        return make_response(json.dumps({
+        return json_response({
             'error': 'invalid_request',
             'error_description': 'Direct mode: use the external authorization server for client registration'
-        }), 400)
+        }, 400)
 
     # Built-in mode
-    body = request.get_json(force=True)
     client_id = str(uuid.uuid4())
     client_secret = secrets.token_urlsafe(32)
     client_data = {
@@ -713,35 +694,29 @@ def oauth_register(server_name):
         'response_types': body.get('response_types', ['code']),
     }
     oauth_clients[client_id] = client_data
-    resp = make_response(json.dumps({**client_data, 'client_id_issued_at': int(time.time())}))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp, 201
+    return json_response({**client_data, 'client_id_issued_at': int(time.time())}, 201)
 
 @app.route('/servers/<server_name>/oauth/authorize', methods=['GET'])
 def oauth_authorize(server_name):
     config = get_config()
     if server_name not in config.get('servers', {}):
-        return make_response(json.dumps({'error': 'Unknown server'}), 404)
+        return json_response({'error': 'Unknown server'}, 404)
 
     preset = get_active_preset(config, server_name)
     mode = preset.get('oauth_mode', 'builtin')
 
     if mode == 'external':
         auth_server = preset.get('authorization_server', '').rstrip('/')
-        try:
-            oidc_resp = http_requests.get(auth_server + '/.well-known/openid-configuration', timeout=10)
-            ext_authorize = oidc_resp.json().get('authorization_endpoint', '')
-        except Exception as e:
-            debug(f'AUTH PROXY: Failed to discover authorize endpoint: {e}')
+        metadata = _get_oidc_metadata(auth_server)
+        if not metadata:
             return make_response('Could not discover external authorization endpoint', 500)
 
-        from urllib.parse import urlencode
+        ext_authorize = metadata.get('authorization_endpoint', '')
         params = dict(request.args)
         params.pop('resource', None)
-        debug(f'AUTH PROXY: Redirecting to {ext_authorize} with params: {params}')
-        redirect_url = ext_authorize + '?' + urlencode(params)
+        debug(f'AUTH PROXY: Redirecting to {ext_authorize}')
         resp = make_response('', 302)
-        resp.headers['Location'] = redirect_url
+        resp.headers['Location'] = ext_authorize + '?' + urlencode(params)
         return resp
 
     if mode == 'direct':
@@ -807,42 +782,41 @@ def oauth_authorize_submit(server_name):
     resp.headers['Location'] = redirect_url
     return resp
 
+def _get_request_body():
+    """Parse request body as dict, handling both JSON and form-encoded (some clients send JSON)."""
+    if request.content_type and 'json' in request.content_type:
+        return request.get_json(force=True) or {}
+    if request.form:
+        return request.form.to_dict()
+    try:
+        return request.get_json(force=True) or {}
+    except Exception:
+        return {}
+
 @app.route('/servers/<server_name>/oauth/token', methods=['POST'])
 def oauth_token(server_name):
     config = get_config()
     if server_name not in config.get('servers', {}):
-        return make_response(json.dumps({'error': 'Unknown server'}), 404)
+        return json_response({'error': 'Unknown server'}, 404)
 
     preset = get_active_preset(config, server_name)
     mode = preset.get('oauth_mode', 'builtin')
 
     if mode == 'external':
         auth_server = preset.get('authorization_server', '').rstrip('/')
-        try:
-            oidc_resp = http_requests.get(auth_server + '/.well-known/openid-configuration', timeout=10)
-            ext_token_url = oidc_resp.json().get('token_endpoint', '')
-        except Exception as e:
-            debug(f'TOKEN PROXY: Failed to discover token endpoint: {e}')
-            return make_response(json.dumps({'error': 'server_error', 'error_description': 'Could not discover token endpoint'}), 500)
+        metadata = _get_oidc_metadata(auth_server)
+        if not metadata:
+            return json_response({'error': 'server_error', 'error_description': 'Could not discover token endpoint'}, 500)
 
-        # Some clients (e.g. ChatGPT) send token requests as JSON instead of form-encoded
-        if request.content_type and 'json' in request.content_type:
-            form_data = request.get_json(force=True)
-        elif request.form:
-            form_data = request.form.to_dict()
-        else:
-            # Try parsing body as JSON fallback
-            try:
-                form_data = request.get_json(force=True) or {}
-            except Exception:
-                form_data = {}
+        ext_token_url = metadata.get('token_endpoint', '')
+        form_data = _get_request_body()
         form_data.pop('resource', None)
         # Always inject the real client credentials — clients may send the placeholder
         # "proxy-managed" secret from DCR, or omit credentials entirely (ChatGPT)
         form_data['client_id'] = preset.get('client_id', '')
         if preset.get('client_secret'):
-            form_data['client_secret'] = preset.get('client_secret', '')
-        debug(f'TOKEN PROXY: Forwarding to {ext_token_url} (content_type={request.content_type}, keys={list(form_data.keys())})')
+            form_data['client_secret'] = preset['client_secret']
+        debug(f'TOKEN PROXY: Forwarding to {ext_token_url} (keys={list(form_data.keys())})')
 
         ext_resp = http_requests.post(
             ext_token_url,
@@ -850,9 +824,8 @@ def oauth_token(server_name):
             headers={'Content-Type': 'application/x-www-form-urlencoded'},
             timeout=15
         )
-        debug(f'TOKEN PROXY: Response status={ext_resp.status_code}')
         if ext_resp.status_code != 200:
-            debug(f'TOKEN PROXY: Error response: {ext_resp.text[:500]}')
+            debug(f'TOKEN PROXY: {ext_resp.status_code}: {ext_resp.text[:500]}')
 
         resp = make_response(ext_resp.text, ext_resp.status_code)
         resp.headers['Content-Type'] = ext_resp.headers.get('Content-Type', 'application/json')
@@ -860,40 +833,35 @@ def oauth_token(server_name):
         return resp
 
     if mode == 'direct':
-        return make_response(json.dumps({
+        return json_response({
             'error': 'invalid_request',
             'error_description': 'Direct mode: clients should exchange tokens with the external server directly'
-        }), 400)
+        }, 400)
 
     # Built-in mode
-    if request.content_type and 'json' in request.content_type:
-        body = request.get_json(force=True)
-    else:
-        body = request.form.to_dict()
-
-    grant_type = body.get('grant_type', '')
-    if grant_type != 'authorization_code':
-        return make_response(json.dumps({'error': 'unsupported_grant_type'}), 400)
+    body = _get_request_body()
+    if body.get('grant_type') != 'authorization_code':
+        return json_response({'error': 'unsupported_grant_type'}, 400)
 
     code = body.get('code', '')
     client_id = body.get('client_id', '')
     code_verifier = body.get('code_verifier', '')
 
     if code not in oauth_auth_codes:
-        return make_response(json.dumps({'error': 'invalid_grant', 'error_description': 'Invalid or expired code'}), 400)
+        return json_response({'error': 'invalid_grant', 'error_description': 'Invalid or expired code'}, 400)
 
     code_data = oauth_auth_codes[code]
     if code_data['expires'] < time.time():
         del oauth_auth_codes[code]
-        return make_response(json.dumps({'error': 'invalid_grant', 'error_description': 'Code expired'}), 400)
+        return json_response({'error': 'invalid_grant', 'error_description': 'Code expired'}, 400)
     if code_data['client_id'] != client_id:
-        return make_response(json.dumps({'error': 'invalid_grant', 'error_description': 'Client mismatch'}), 400)
+        return json_response({'error': 'invalid_grant', 'error_description': 'Client mismatch'}, 400)
 
     if code_data.get('code_challenge'):
         if not code_verifier:
-            return make_response(json.dumps({'error': 'invalid_grant', 'error_description': 'code_verifier required'}), 400)
+            return json_response({'error': 'invalid_grant', 'error_description': 'code_verifier required'}, 400)
         if not verify_pkce(code_verifier, code_data['code_challenge'], code_data.get('code_challenge_method', 'S256')):
-            return make_response(json.dumps({'error': 'invalid_grant', 'error_description': 'PKCE verification failed'}), 400)
+            return json_response({'error': 'invalid_grant', 'error_description': 'PKCE verification failed'}, 400)
 
     del oauth_auth_codes[code]
 
@@ -906,12 +874,10 @@ def oauth_token(server_name):
         'user': code_data['user'], 'expires': time.time() + expires_in, 'active': True,
     }
 
-    token_resp = {
+    resp = json_response({
         'access_token': access_token, 'token_type': 'Bearer',
         'expires_in': expires_in, 'refresh_token': refresh_token, 'scope': code_data['scope'],
-    }
-    resp = make_response(json.dumps(token_resp))
-    resp.headers['Content-Type'] = 'application/json'
+    })
     resp.headers['Cache-Control'] = 'no-store'
     return resp
 
@@ -919,22 +885,17 @@ def oauth_token(server_name):
 def oauth_introspect(server_name):
     token = request.form.get('token', '')
     if not token or token not in oauth_tokens_store:
-        resp = make_response(json.dumps({'active': False}))
-        resp.headers['Content-Type'] = 'application/json'
-        return resp
+        return json_response({'active': False})
 
-    token_data = oauth_tokens_store[token]
-    if token_data['expires'] < time.time():
-        token_data['active'] = False
+    td = oauth_tokens_store[token]
+    if td['expires'] < time.time():
+        td['active'] = False
 
-    result = {
-        'active': token_data['active'], 'client_id': token_data['client_id'],
-        'scope': token_data['scope'], 'sub': token_data['user'],
-        'exp': int(token_data['expires']), 'aud': get_base_url(), 'token_type': 'Bearer',
-    }
-    resp = make_response(json.dumps(result))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
+    return json_response({
+        'active': td['active'], 'client_id': td['client_id'],
+        'scope': td['scope'], 'sub': td['user'],
+        'exp': int(td['expires']), 'aud': get_base_url(), 'token_type': 'Bearer',
+    })
 
 
 # ============================================================
@@ -947,7 +908,7 @@ def mcp_post(server_name):
     """MCP StreamableHTTP POST handler."""
     config = get_config()
     if server_name not in config.get('servers', {}):
-        return make_response(json.dumps({'error': 'Unknown server'}), 404)
+        return json_response({'error': 'Unknown server'}, 404)
 
     body = request.get_json(force=True)
     session_id = request.headers.get('Mcp-Session-Id')
@@ -955,42 +916,38 @@ def mcp_post(server_name):
     if server_name not in sessions:
         sessions[server_name] = {}
 
+    msg_id = body.get('id') if isinstance(body, dict) else None
+
     if not session_id:
         if isinstance(body, dict) and body.get('method') == 'initialize':
             new_session_id = str(uuid.uuid4())
             sessions[server_name][new_session_id] = {'created': time.time(), 'last_active': time.time()}
-
             result = handle_mcp_message(body, server_name)
-            resp = make_response(json.dumps(result))
-            resp.headers['Content-Type'] = 'application/json'
+            resp = json_response(result)
             resp.headers['Mcp-Session-Id'] = new_session_id
             return resp
-        else:
-            return make_response(json.dumps({
-                'jsonrpc': '2.0',
-                'error': {'code': -32000, 'message': 'Bad Request: No valid session ID'},
-                'id': body.get('id') if isinstance(body, dict) else None
-            }), 400)
+        return json_response({
+            'jsonrpc': '2.0', 'id': msg_id,
+            'error': {'code': -32000, 'message': 'Bad Request: No valid session ID'},
+        }, 400)
 
     if session_id not in sessions.get(server_name, {}):
-        return make_response(json.dumps({
-            'jsonrpc': '2.0',
+        return json_response({
+            'jsonrpc': '2.0', 'id': msg_id,
             'error': {'code': -32000, 'message': 'Invalid session ID'},
-            'id': body.get('id') if isinstance(body, dict) else None
-        }), 400)
+        }, 400)
 
     sessions[server_name][session_id]['last_active'] = time.time()
 
     if isinstance(body, list):
         results = [r for msg in body if (r := handle_mcp_message(msg, server_name)) is not None]
-        resp = make_response(json.dumps(results))
+        resp = json_response(results)
     else:
         result = handle_mcp_message(body, server_name)
         if result is None:
             return make_response('', 202)
-        resp = make_response(json.dumps(result))
+        resp = json_response(result)
 
-    resp.headers['Content-Type'] = 'application/json'
     resp.headers['Mcp-Session-Id'] = session_id
     return resp
 
@@ -1024,12 +981,9 @@ def require_dataiku_auth(f):
     The webapp UI passes the user's API key via X-DKU-APIKey header."""
     @wraps(f)
     def decorated(*args, **kwargs):
-        import dataikuapi
-
         dku_api_key = request.headers.get('X-DKU-APIKey', '')
         if not dku_api_key:
-            return make_response(json.dumps({'error': 'Admin endpoints require Dataiku API key (X-DKU-APIKey header)'}), 401,
-                                 {'Content-Type': 'application/json'})
+            return json_response({'error': 'Admin endpoints require Dataiku API key (X-DKU-APIKey header)'}, 401)
 
         try:
             dss_url = dataiku.api_client().host
@@ -1037,8 +991,7 @@ def require_dataiku_auth(f):
             test_client.list_project_keys()
             return f(*args, **kwargs)
         except Exception:
-            return make_response(json.dumps({'error': 'Invalid API key'}), 401,
-                                 {'Content-Type': 'application/json'})
+            return json_response({'error': 'Invalid API key'}, 401)
     return decorated
 
 @app.route('/admin/config', methods=['GET'])
@@ -1048,16 +1001,8 @@ def get_admin_config():
     config = get_config()
     safe = dict(config)
     if 'presets' in safe:
-        safe_presets = {}
-        for key, preset in safe['presets'].items():
-            sp = {k: v for k, v in preset.items() if k != 'client_secret'}
-            sp['has_client_secret'] = bool(preset.get('client_secret'))
-            safe_presets[key] = sp
-        safe['presets'] = safe_presets
-    safe.pop('client_secret', None)
-    resp = make_response(json.dumps(safe))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
+        safe['presets'] = {k: _strip_secret(v) for k, v in safe['presets'].items()}
+    return json_response(safe)
 
 @app.route('/admin/config', methods=['POST'])
 @require_dataiku_auth
@@ -1072,39 +1017,36 @@ def save_admin_config():
 
     new_config['config_version'] = 2
     save_config(new_config)
-    resp = make_response(json.dumps({'status': 'ok'}))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
+    return json_response({'status': 'ok'})
 
 # ============================================================
 # Routes: Server Management
 # ============================================================
+
+def _build_server_status(name, server, config):
+    """Build status dict for a server (shared by list_servers and health)."""
+    preset_key = server.get('active_preset', '')
+    preset = config.get('presets', {}).get(preset_key, {})
+    agent = server.get('agent', {})
+    return {
+        'display_name': server.get('display_name', name),
+        'active_preset': preset_key,
+        'preset_name': preset.get('name', preset_key),
+        'oauth_enabled': preset.get('oauth_enabled', False),
+        'oauth_mode': preset.get('oauth_mode', ''),
+        'agent': agent,
+        'agent_configured': bool(agent.get('project_key') and agent.get('tool_ids')),
+        'mcp_url': get_base_url() + '/servers/' + name + '/mcp',
+    }
 
 @app.route('/admin/servers', methods=['GET'])
 @require_dataiku_auth
 def list_servers():
     """List all servers."""
     config = get_config()
-    servers = config.get('servers', {})
-    base_url = get_base_url()
-    result = {}
-    for name, server in servers.items():
-        preset_key = server.get('active_preset', '')
-        preset = config.get('presets', {}).get(preset_key, {})
-        agent = server.get('agent', {})
-        result[name] = {
-            'display_name': server.get('display_name', name),
-            'active_preset': preset_key,
-            'preset_name': preset.get('name', preset_key),
-            'oauth_enabled': preset.get('oauth_enabled', False),
-            'oauth_mode': preset.get('oauth_mode', ''),
-            'agent': agent,
-            'agent_configured': bool(agent.get('project_key') and agent.get('tool_ids')),
-            'mcp_url': base_url + '/servers/' + name + '/mcp',
-        }
-    resp = make_response(json.dumps(result))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
+    result = {name: _build_server_status(name, srv, config)
+              for name, srv in config.get('servers', {}).items()}
+    return json_response(result)
 
 @app.route('/admin/servers', methods=['POST'])
 @require_dataiku_auth
@@ -1115,37 +1057,27 @@ def save_server():
     server_data = body.get('server_data', {})
 
     if not name:
-        return make_response(json.dumps({'error': 'Server name is required'}), 400)
+        return json_response({'error': 'Server name is required'}, 400)
     if not is_valid_server_name(name):
-        return make_response(json.dumps({'error': 'Server name must be a URL-safe slug (lowercase letters, numbers, hyphens)'}), 400)
+        return json_response({'error': 'Server name must be a URL-safe slug (lowercase letters, numbers, hyphens)'}, 400)
 
     config = get_config()
-    if 'servers' not in config:
-        config['servers'] = {}
-
-    config['servers'][name] = server_data
+    config.setdefault('servers', {})[name] = server_data
     save_config(config)
-    resp = make_response(json.dumps({'status': 'ok', 'name': name}))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
+    return json_response({'status': 'ok', 'name': name})
 
 @app.route('/admin/servers/<name>', methods=['DELETE'])
 @require_dataiku_auth
 def delete_server(name):
     """Delete a server."""
     config = get_config()
-    servers = config.get('servers', {})
+    if name not in config.get('servers', {}):
+        return json_response({'error': 'Server not found'}, 404)
 
-    if name not in servers:
-        return make_response(json.dumps({'error': 'Server not found'}), 404)
-
-    del servers[name]
-    # Clean up sessions
+    del config['servers'][name]
     sessions.pop(name, None)
     save_config(config)
-    resp = make_response(json.dumps({'status': 'ok'}))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
+    return json_response({'status': 'ok'})
 
 # ============================================================
 # Routes: Preset Management
@@ -1156,7 +1088,6 @@ def delete_server(name):
 def list_presets():
     """List all presets (sans secrets)."""
     config = get_config()
-    presets = config.get('presets', {})
     # Determine which presets are active on which servers
     active_on = {}
     for sname, sconf in config.get('servers', {}).items():
@@ -1165,14 +1096,11 @@ def list_presets():
             active_on.setdefault(pk, []).append(sname)
 
     result = {}
-    for key, preset in presets.items():
-        safe = {k: v for k, v in preset.items() if k != 'client_secret'}
-        safe['has_client_secret'] = bool(preset.get('client_secret'))
+    for key, preset in config.get('presets', {}).items():
+        safe = _strip_secret(preset)
         safe['active_on_servers'] = active_on.get(key, [])
         result[key] = safe
-    resp = make_response(json.dumps(result))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
+    return json_response(result)
 
 @app.route('/admin/presets', methods=['POST'])
 @require_dataiku_auth
@@ -1183,22 +1111,20 @@ def save_preset():
     preset_data = body.get('preset_data', {})
 
     if not key:
-        return make_response(json.dumps({'error': 'Preset key is required'}), 400)
+        return json_response({'error': 'Preset key is required'}, 400)
 
     config = get_config()
-    if 'presets' not in config:
-        config['presets'] = {}
+    presets = config.setdefault('presets', {})
 
-    if key in config['presets'] and 'client_secret' not in preset_data:
-        existing_secret = config['presets'][key].get('client_secret')
+    # Preserve existing secret if not being updated
+    if key in presets and 'client_secret' not in preset_data:
+        existing_secret = presets[key].get('client_secret')
         if existing_secret:
             preset_data['client_secret'] = existing_secret
 
-    config['presets'][key] = preset_data
+    presets[key] = preset_data
     save_config(config)
-    resp = make_response(json.dumps({'status': 'ok', 'key': key}))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
+    return json_response({'status': 'ok', 'key': key})
 
 @app.route('/admin/presets/<key>', methods=['DELETE'])
 @require_dataiku_auth
@@ -1208,20 +1134,17 @@ def delete_preset(key):
     presets = config.get('presets', {})
 
     if key not in presets:
-        return make_response(json.dumps({'error': 'Preset not found'}), 404)
+        return json_response({'error': 'Preset not found'}, 404)
 
-    # Check if active on any server
     for sname, sconf in config.get('servers', {}).items():
         if sconf.get('active_preset') == key:
-            return make_response(json.dumps({
+            return json_response({
                 'error': f'Cannot delete: preset is active on server "{sname}". Change the server\'s preset first.'
-            }), 400)
+            }, 400)
 
     del presets[key]
     save_config(config)
-    resp = make_response(json.dumps({'status': 'ok'}))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
+    return json_response({'status': 'ok'})
 
 # ============================================================
 # Routes: Admin Utilities
@@ -1232,13 +1155,10 @@ def delete_preset(key):
 def list_project_keys():
     """List all project keys for autocomplete."""
     try:
-        keys = dataiku.api_client().list_project_keys()
-        resp = make_response(json.dumps(keys))
-        resp.headers['Content-Type'] = 'application/json'
-        return resp
+        return json_response(dataiku.api_client().list_project_keys())
     except Exception as e:
         logger.error(f"Error listing project keys: {e}")
-        return make_response(json.dumps([]), 200)
+        return json_response([])
 
 @app.route('/admin/agents', methods=['GET'])
 @require_dataiku_auth
@@ -1270,9 +1190,7 @@ def list_available_agents():
     except Exception as e:
         logger.error(f"Error listing agents: {e}")
 
-    resp = make_response(json.dumps(result))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
+    return json_response(result)
 
 @app.route('/admin/discover', methods=['POST'])
 @require_dataiku_auth
@@ -1282,68 +1200,38 @@ def discover_oauth():
     issuer_url = body.get('issuer_url', '').rstrip('/')
 
     if not issuer_url:
-        return make_response(json.dumps({'error': 'issuer_url required'}), 400)
+        return json_response({'error': 'issuer_url required'}, 400)
 
-    for suffix in ['/.well-known/openid-configuration', '/.well-known/oauth-authorization-server']:
-        try:
-            resp = http_requests.get(issuer_url + suffix, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                result = {
-                    'issuer': data.get('issuer', issuer_url),
-                    'authorization_endpoint': data.get('authorization_endpoint', ''),
-                    'token_endpoint': data.get('token_endpoint', ''),
-                    'introspection_endpoint': data.get('introspection_endpoint', ''),
-                    'registration_endpoint': data.get('registration_endpoint', ''),
-                    'scopes_supported': data.get('scopes_supported', []),
-                }
-                r = make_response(json.dumps(result))
-                r.headers['Content-Type'] = 'application/json'
-                return r
-        except Exception:
-            continue
+    data = _get_oidc_metadata(issuer_url)
+    if not data:
+        return json_response({'error': 'Could not discover OAuth endpoints'}, 404)
 
-    return make_response(json.dumps({'error': 'Could not discover OAuth endpoints'}), 404)
+    return json_response({
+        'issuer': data.get('issuer', issuer_url),
+        'authorization_endpoint': data.get('authorization_endpoint', ''),
+        'token_endpoint': data.get('token_endpoint', ''),
+        'introspection_endpoint': data.get('introspection_endpoint', ''),
+        'registration_endpoint': data.get('registration_endpoint', ''),
+        'scopes_supported': data.get('scopes_supported', []),
+    })
 
 @app.route('/admin/health')
 @require_dataiku_auth
 def health():
     """Health check endpoint with per-server status."""
     config = get_config()
-    servers = config.get('servers', {})
-    base_url = get_base_url()
+    statuses = {name: _build_server_status(name, srv, config)
+                for name, srv in config.get('servers', {}).items()}
 
-    server_statuses = {}
-    for name, server in servers.items():
-        preset_key = server.get('active_preset', '')
-        preset = config.get('presets', {}).get(preset_key, {})
-        agent = server.get('agent', {})
-        server_statuses[name] = {
-            'display_name': server.get('display_name', name),
-            'oauth_enabled': preset.get('oauth_enabled', False),
-            'oauth_mode': preset.get('oauth_mode', ''),
-            'preset_name': preset.get('name', ''),
-            'agent_configured': bool(agent.get('project_key') and agent.get('tool_ids')),
-            'mcp_url': base_url + '/servers/' + name + '/mcp',
-        }
-
-    any_configured = any(s['agent_configured'] for s in server_statuses.values()) if server_statuses else False
-    any_oauth = any(s['oauth_enabled'] for s in server_statuses.values()) if server_statuses else False
-
-    status = {
+    return json_response({
         'status': 'running',
-        'server_count': len(servers),
-        'servers': server_statuses,
-        'any_agent_configured': any_configured,
-        'any_oauth_enabled': any_oauth,
-    }
-    resp = make_response(json.dumps(status))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
+        'server_count': len(statuses),
+        'servers': statuses,
+        'any_agent_configured': any(s['agent_configured'] for s in statuses.values()) if statuses else False,
+        'any_oauth_enabled': any(s['oauth_enabled'] for s in statuses.values()) if statuses else False,
+    })
 
 @app.route('/admin/debug-log')
 @require_dataiku_auth
 def get_debug_log():
-    resp = make_response(json.dumps(_debug_log, indent=2))
-    resp.headers['Content-Type'] = 'application/json'
-    return resp
+    return json_response(_debug_log)
