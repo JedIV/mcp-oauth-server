@@ -961,8 +961,9 @@ def mcp_delete(server_name):
 # ============================================================
 
 def require_dataiku_auth(f):
-    """Require valid Dataiku API key for admin endpoints.
-    The webapp UI passes the user's API key via X-DKU-APIKey header."""
+    """Require valid Dataiku API key with access to this project.
+    The webapp UI passes the user's API key via X-DKU-APIKey header.
+    We verify by reading project variables — the same resource admin endpoints modify."""
     @wraps(f)
     def decorated(*args, **kwargs):
         dku_api_key = request.headers.get('X-DKU-APIKey', '')
@@ -972,10 +973,11 @@ def require_dataiku_auth(f):
         try:
             dss_url = dataiku.api_client().host
             test_client = dataikuapi.DSSClient(dss_url, api_key=dku_api_key)
-            test_client.list_project_keys()
+            project_key = dataiku.api_client().get_default_project().project_key
+            test_client.get_project(project_key).get_variables()
             return f(*args, **kwargs)
         except Exception:
-            return json_response({'error': 'Invalid API key'}, 401)
+            return json_response({'error': 'Invalid API key or insufficient project permissions'}, 401)
     return decorated
 
 @app.route('/admin/config', methods=['GET'])
