@@ -34,6 +34,30 @@ PRESET_FIELDS = {'oauth_mode', 'oauth_enabled', 'authorization_server', 'client_
 
 SERVER_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{0,38}[a-z0-9]$|^[a-z0-9]$')
 
+def _validate_url(url, field_name='URL'):
+    """Validate that a URL is safe (HTTPS only, no private/local targets)."""
+    if not url:
+        return None  # Empty is fine (field not set)
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme not in ('https',):
+        return f'{field_name} must use HTTPS (got {parsed.scheme}://)'
+    host = parsed.hostname or ''
+    if not host:
+        return f'{field_name} has no hostname'
+    # Block localhost and private IPs
+    if host in ('localhost', '127.0.0.1', '0.0.0.0', '::1', '[::1]'):
+        return f'{field_name} cannot target localhost'
+    # Block private IP ranges
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return f'{field_name} cannot target private/reserved IP addresses'
+    except ValueError:
+        pass  # It's a hostname, not an IP — that's fine
+    return None
+
 def is_valid_server_name(name):
     return bool(SERVER_NAME_RE.match(name))
 
@@ -1007,16 +1031,25 @@ def get_admin_config():
 @app.route('/admin/config', methods=['POST'])
 @require_dataiku_auth
 def save_admin_config():
-    """Save top-level config fields. OAuth fields go through preset endpoints."""
+    """Save top-level config fields only (base_url). Presets and servers use their own CRUD endpoints."""
     new_config = request.get_json(force=True)
     existing = get_config()
 
-    for key in ('presets', 'servers', 'base_url', 'config_version'):
-        if key not in new_config and key in existing:
-            new_config[key] = existing[key]
+    # Only allow updating base_url — presets/servers have dedicated endpoints
+    PROTECTED_KEYS = {'presets', 'servers', 'config_version'}
+    for key in PROTECTED_KEYS:
+        if key in new_config:
+            return json_response({'error': 'Cannot modify ' + key + ' through this endpoint; use dedicated CRUD endpoints'}, 400)
 
-    new_config['config_version'] = 2
-    save_config(new_config)
+    # Preserve all existing keys, only update allowed fields
+    merged = dict(existing)
+    ALLOWED_KEYS = {'base_url'}
+    for key in ALLOWED_KEYS:
+        if key in new_config:
+            merged[key] = new_config[key]
+
+    merged['config_version'] = 2
+    save_config(merged)
     return json_response({'status': 'ok'})
 
 # ============================================================
@@ -1113,6 +1146,12 @@ def save_preset():
     if not key:
         return json_response({'error': 'Preset key is required'}, 400)
 
+    # Validate URLs to prevent SSRF
+    for url_field in ('authorization_server', 'introspection_endpoint'):
+        url_err = _validate_url(preset_data.get(url_field, ''), url_field)
+        if url_err:
+            return json_response({'error': url_err}, 400)
+
     config = get_config()
     presets = config.setdefault('presets', {})
 
@@ -1201,6 +1240,10 @@ def discover_oauth():
 
     if not issuer_url:
         return json_response({'error': 'issuer_url required'}, 400)
+
+    url_err = _validate_url(issuer_url, 'Issuer URL')
+    if url_err:
+        return json_response({'error': url_err}, 400)
 
     data = _get_oidc_metadata(issuer_url)
     if not data:

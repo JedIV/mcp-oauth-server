@@ -62,6 +62,11 @@ function slugify(name) {
 
 const MODE_LABELS = { builtin: 'Built-in', external: 'External IdP', direct: 'Direct OAuth' };
 
+function escHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
 function getServerMcpUrl(serverName) {
     return autoBaseUrl + '/servers/' + serverName + '/mcp';
 }
@@ -112,15 +117,15 @@ function renderServerList() {
         return `
             <div class="server-row">
                 <div class="server-info">
-                    <div class="server-name">${s.display_name || name}</div>
+                    <div class="server-name">${escHtml(s.display_name || name)}</div>
                     <div class="server-meta">
                         ${agentBadge} ${oauthBadge}
-                        <span class="server-url-label">${s.mcp_url}</span>
+                        <span class="server-url-label">${escHtml(s.mcp_url)}</span>
                     </div>
                 </div>
                 <div class="server-row-actions">
-                    <button onclick="editServer('${name}')" class="btn-small">Edit</button>
-                    <button onclick="deleteServer('${name}')" class="btn-small btn-danger">Delete</button>
+                    <button onclick="editServer('${escHtml(name)}')" class="btn-small">Edit</button>
+                    <button onclick="deleteServer('${escHtml(name)}')" class="btn-small btn-danger">Delete</button>
                 </div>
             </div>`;
     }).join('');
@@ -237,16 +242,16 @@ async function loadServerAgentTools(preCheckedIds) {
 
         toolsList.innerHTML = tools.map(t => `
             <div class="tool-item">
-                <input type="checkbox" id="stool-${t.tool_id}" value="${t.tool_id}"
+                <input type="checkbox" id="stool-${escHtml(t.tool_id)}" value="${escHtml(t.tool_id)}"
                     ${preCheckedIds.includes(t.tool_id) ? 'checked' : ''}>
                 <div class="tool-info">
-                    <div class="tool-name">${t.tool_name}</div>
-                    <div class="tool-type">${t.tool_type} &middot; ${t.tool_id}</div>
+                    <div class="tool-name">${escHtml(t.tool_name)}</div>
+                    <div class="tool-type">${escHtml(t.tool_type)} &middot; ${escHtml(t.tool_id)}</div>
                 </div>
             </div>
         `).join('');
     } catch (e) {
-        toolsList.innerHTML = '<p class="help">Error loading tools: ' + e.message + '</p>';
+        toolsList.innerHTML = '<p class="help">Error loading tools: ' + escHtml(e.message) + '</p>';
     }
 }
 
@@ -378,23 +383,23 @@ function renderPresetList() {
         const modeLabel = MODE_LABELS[p.oauth_mode] || p.oauth_mode;
         const activeServers = (p.active_on_servers || []);
         const activeBadge = activeServers.length > 0
-            ? '<span class="badge badge-ok">used by: ' + activeServers.join(', ') + '</span>'
+            ? '<span class="badge badge-ok">used by: ' + escHtml(activeServers.join(', ')) + '</span>'
             : '';
         const authBadge = p.oauth_enabled
-            ? '<span class="badge badge-mode">' + modeLabel + '</span>'
+            ? '<span class="badge badge-mode">' + escHtml(modeLabel) + '</span>'
             : '<span class="badge badge-warn">auth off</span>';
         const deleteBtn = activeServers.length > 0
             ? ''
-            : `<button onclick="deletePreset('${key}')" class="btn-small btn-danger">Delete</button>`;
+            : `<button onclick="deletePreset('${escHtml(key)}')" class="btn-small btn-danger">Delete</button>`;
 
         return `
             <div class="preset-row ${activeServers.length > 0 ? 'preset-active' : ''}">
                 <div class="preset-info">
-                    <div class="preset-name">${p.name || key} ${activeBadge}</div>
-                    <div class="preset-meta">${authBadge} <span class="preset-key-label">${key}</span></div>
+                    <div class="preset-name">${escHtml(p.name || key)} ${activeBadge}</div>
+                    <div class="preset-meta">${authBadge} <span class="preset-key-label">${escHtml(key)}</span></div>
                 </div>
                 <div class="preset-row-actions">
-                    <button onclick="editPreset('${key}')" class="btn-small">Edit</button>
+                    <button onclick="editPreset('${escHtml(key)}')" class="btn-small">Edit</button>
                     ${deleteBtn}
                 </div>
             </div>`;
@@ -741,7 +746,7 @@ async function loadProjectKeys() {
         const resp = await adminFetch(backendUrl + 'admin/project-keys');
         const keys = await resp.json();
         const datalist = document.getElementById('project-keys-list');
-        datalist.innerHTML = keys.map(k => `<option value="${k}">`).join('');
+        datalist.innerHTML = keys.map(k => `<option value="${escHtml(k)}">`).join('');
     } catch (e) {
         console.error('Failed to load project keys:', e);
     }
