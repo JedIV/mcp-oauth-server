@@ -670,6 +670,12 @@ def oauth_authorize(server_name):
         ext_authorize = metadata.get('authorization_endpoint', '')
         params = dict(request.args)
         params.pop('resource', None)
+        preset_client_id = preset.get('client_id', '')
+        requested_client_id = params.get('client_id', '')
+        if requested_client_id and preset_client_id and requested_client_id != preset_client_id:
+            return make_response('client_id does not match configured OAuth client', 400)
+        if preset_client_id:
+            params['client_id'] = preset_client_id
         debug(f'AUTH PROXY: Redirecting to {ext_authorize}')
         resp = make_response('', 302)
         resp.headers['Location'] = ext_authorize + '?' + urlencode(params)
@@ -766,6 +772,28 @@ def oauth_token(server_name):
 
         ext_token_url = metadata.get('token_endpoint', '')
         form_data = _get_request_body()
+        grant_type = form_data.get('grant_type', '')
+        if grant_type not in ('authorization_code', 'refresh_token'):
+            return json_response({
+                'error': 'unsupported_grant_type',
+                'error_description': f'Grant type "{grant_type}" is not permitted through the token proxy'
+            }, 400)
+        if grant_type == 'authorization_code':
+            if not form_data.get('code'):
+                return json_response({
+                    'error': 'invalid_request',
+                    'error_description': 'code is required'
+                }, 400)
+            if not form_data.get('code_verifier'):
+                return json_response({
+                    'error': 'invalid_request',
+                    'error_description': 'code_verifier is required'
+                }, 400)
+        if grant_type == 'refresh_token' and not form_data.get('refresh_token'):
+            return json_response({
+                'error': 'invalid_request',
+                'error_description': 'refresh_token is required'
+            }, 400)
         form_data.pop('resource', None)
         # Always inject the real client credentials — clients may send the placeholder
         # "proxy-managed" secret from DCR, or omit credentials entirely (ChatGPT)
