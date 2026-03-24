@@ -8,10 +8,12 @@ import re
 import hashlib
 import base64
 import secrets
-from urllib.parse import urlencode
-import requests as http_requests
-from collections import defaultdict
+import ipaddress
+import socket
+from collections import defaultdict, deque
 from functools import wraps
+from urllib.parse import urlencode, urlparse
+import requests as http_requests
 from flask import request, make_response, Response
 
 import jwt as pyjwt
@@ -40,9 +42,6 @@ def _validate_url(url, field_name='URL'):
     Resolves hostnames to IPs to block DNS rebinding and internal-pointing hostnames."""
     if not url:
         return None  # Empty is fine (field not set)
-    from urllib.parse import urlparse
-    import ipaddress
-    import socket
     parsed = urlparse(url)
     if parsed.scheme not in ('https',):
         return f'{field_name} must use HTTPS (got {parsed.scheme}://)'
@@ -105,15 +104,22 @@ def get_active_preset(config, server_name=None):
             return presets[active_key]
     return {}
 
+def _get_server_or_404(server_name):
+    """Load config and verify server exists. Returns (config, preset, mode) or raises a 404 response."""
+    config = get_config()
+    if server_name not in config.get('servers', {}):
+        return None
+    preset = get_active_preset(config, server_name)
+    mode = preset.get('oauth_mode', 'builtin')
+    return config, preset, mode
+
 # ============================================================
 # Debug log (in-memory ring buffer for troubleshooting)
 # ============================================================
-_debug_log = [{'t': 0, 'msg': '--- restart ---'}]
+_debug_log = deque([{'t': 0, 'msg': '--- restart ---'}], maxlen=200)
 
 def debug(msg):
     _debug_log.append({'t': time.time(), 'msg': str(msg)})
-    if len(_debug_log) > 200:
-        _debug_log.pop(0)
     logger.info(msg)
 
 # debug-log route registered after require_dataiku_auth is defined (see bottom of admin section)
@@ -345,7 +351,7 @@ def require_bearer_auth(f):
 # MCP Protocol (StreamableHTTP, JSON-RPC 2.0)
 # ============================================================
 
-sessions = {}  # sessions[server_name][session_id] -> {created, last_active}
+sessions = defaultdict(dict)  # server_name -> {session_id -> {created, last_active}}
 
 def handle_mcp_message(message, server_name):
     """Route a single MCP JSON-RPC message to the right handler."""
@@ -528,34 +534,38 @@ def build_login_html(client_name, scope, client_id, redirect_uri, state, code_ch
     return """<!DOCTYPE html>
 <html><head><title>MCP OAuth - Authorize</title>
 <style>
-body { font-family: -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #f5f6f8; margin: 0; }
-.card { background: #fff; border-radius: 12px; padding: 32px; max-width: 400px; width: 100%%; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-h2 { margin: 0 0 8px; font-size: 20px; }
-.client-name { color: #2563eb; font-weight: 600; }
-.scope { background: #e2e8f0; padding: 4px 8px; border-radius: 4px; font-size: 13px; display: inline-block; }
-.form-group { margin: 16px 0; }
-label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 4px; }
-input[type="text"], input[type="password"] { width: 100%%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; box-sizing: border-box; }
-.btn { padding: 10px 24px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; width: 100%%; background: #2563eb; color: #fff; }
-.btn:hover { background: #1d4ed8; }
-.help { font-size: 12px; color: #6b7280; margin-top: 12px; }
+body {{ font-family: -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #f5f6f8; margin: 0; }}
+.card {{ background: #fff; border-radius: 12px; padding: 32px; max-width: 400px; width: 100%; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+h2 {{ margin: 0 0 8px; font-size: 20px; }}
+.client-name {{ color: #2563eb; font-weight: 600; }}
+.scope {{ background: #e2e8f0; padding: 4px 8px; border-radius: 4px; font-size: 13px; display: inline-block; }}
+.form-group {{ margin: 16px 0; }}
+label {{ display: block; font-size: 13px; font-weight: 500; margin-bottom: 4px; }}
+input[type="text"], input[type="password"] {{ width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; box-sizing: border-box; }}
+.btn {{ padding: 10px 24px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; width: 100%; background: #2563eb; color: #fff; }}
+.btn:hover {{ background: #1d4ed8; }}
+.help {{ font-size: 12px; color: #6b7280; margin-top: 12px; }}
 </style></head><body><div class="card">
 <h2>Authorize Access</h2>
-<p><span class="client-name">%s</span> wants to access your MCP tools.</p>
-<p>Requested scope: <span class="scope">%s</span></p>
-<form method="POST" action="%s/servers/%s/oauth/authorize/submit">
-<input type="hidden" name="client_id" value="%s">
-<input type="hidden" name="redirect_uri" value="%s">
-<input type="hidden" name="scope" value="%s">
-<input type="hidden" name="state" value="%s">
-<input type="hidden" name="code_challenge" value="%s">
-<input type="hidden" name="code_challenge_method" value="%s">
+<p><span class="client-name">{client_name}</span> wants to access your MCP tools.</p>
+<p>Requested scope: <span class="scope">{scope}</span></p>
+<form method="POST" action="{base_url}/servers/{server_name}/oauth/authorize/submit">
+<input type="hidden" name="client_id" value="{client_id}">
+<input type="hidden" name="redirect_uri" value="{redirect_uri}">
+<input type="hidden" name="scope" value="{scope}">
+<input type="hidden" name="state" value="{state}">
+<input type="hidden" name="code_challenge" value="{code_challenge}">
+<input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
 <div class="form-group"><label>Username</label><input type="text" name="username" placeholder="admin" required></div>
 <div class="form-group"><label>Password</label><input type="password" name="password" placeholder="admin" required></div>
 <button type="submit" class="btn">Approve</button>
 </form>
 <p class="help">Test credentials: admin / admin</p>
-</div></body></html>""" % (client_name, scope, base_url, server_name, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method)
+</div></body></html>""".format(
+        client_name=client_name, scope=scope, base_url=base_url,
+        server_name=server_name, client_id=client_id, redirect_uri=redirect_uri,
+        state=state, code_challenge=code_challenge, code_challenge_method=code_challenge_method,
+    )
 
 
 # ============================================================
@@ -564,12 +574,10 @@ input[type="text"], input[type="password"] { width: 100%%; padding: 8px 12px; bo
 
 @app.route('/servers/<server_name>/.well-known/openid-configuration')
 def oidc_discovery(server_name):
-    config = get_config()
-    if server_name not in config.get('servers', {}):
+    result = _get_server_or_404(server_name)
+    if not result:
         return json_response({'error': 'Unknown server'}, 404)
-
-    preset = get_active_preset(config, server_name)
-    mode = preset.get('oauth_mode', 'builtin')
+    config, preset, mode = result
     base_url = get_base_url()
     server_base = base_url + '/servers/' + server_name
 
@@ -601,12 +609,10 @@ def oauth_as_metadata(server_name):
 @app.route('/servers/<server_name>/.well-known/oauth-protected-resource')
 def oauth_protected_resource(server_name):
     """RFC 9728 Protected Resource Metadata."""
-    config = get_config()
-    if server_name not in config.get('servers', {}):
+    result = _get_server_or_404(server_name)
+    if not result:
         return json_response({'error': 'Unknown server'}, 404)
-
-    preset = get_active_preset(config, server_name)
-    mode = preset.get('oauth_mode', 'builtin')
+    config, preset, mode = result
     base_url = get_base_url()
     server_base = base_url + '/servers/' + server_name
 
@@ -620,12 +626,10 @@ def oauth_protected_resource(server_name):
 
 @app.route('/servers/<server_name>/oauth/register', methods=['POST'])
 def oauth_register(server_name):
-    config = get_config()
-    if server_name not in config.get('servers', {}):
+    result = _get_server_or_404(server_name)
+    if not result:
         return json_response({'error': 'Unknown server'}, 404)
-
-    preset = get_active_preset(config, server_name)
-    mode = preset.get('oauth_mode', 'builtin')
+    config, preset, mode = result
     body = request.get_json(force=True)
 
     if mode == 'external':
@@ -663,12 +667,10 @@ def oauth_register(server_name):
 
 @app.route('/servers/<server_name>/oauth/authorize', methods=['GET'])
 def oauth_authorize(server_name):
-    config = get_config()
-    if server_name not in config.get('servers', {}):
+    result = _get_server_or_404(server_name)
+    if not result:
         return json_response({'error': 'Unknown server'}, 404)
-
-    preset = get_active_preset(config, server_name)
-    mode = preset.get('oauth_mode', 'builtin')
+    config, preset, mode = result
 
     if mode == 'external':
         auth_server = preset.get('authorization_server', '').rstrip('/')
@@ -756,24 +758,17 @@ def oauth_authorize_submit(server_name):
     return resp
 
 def _get_request_body():
-    """Parse request body as dict, handling both JSON and form-encoded (some clients send JSON)."""
-    if request.content_type and 'json' in request.content_type:
-        return request.get_json(force=True) or {}
+    """Parse request body as form-encoded or JSON (some clients send JSON for token requests)."""
     if request.form:
         return request.form.to_dict()
-    try:
-        return request.get_json(force=True) or {}
-    except Exception:
-        return {}
+    return request.get_json(force=True) or {}
 
 @app.route('/servers/<server_name>/oauth/token', methods=['POST'])
 def oauth_token(server_name):
-    config = get_config()
-    if server_name not in config.get('servers', {}):
+    result = _get_server_or_404(server_name)
+    if not result:
         return json_response({'error': 'Unknown server'}, 404)
-
-    preset = get_active_preset(config, server_name)
-    mode = preset.get('oauth_mode', 'builtin')
+    config, preset, mode = result
 
     if mode == 'external':
         auth_server = preset.get('authorization_server', '').rstrip('/')
@@ -901,16 +896,11 @@ def oauth_introspect(server_name):
 @require_bearer_auth
 def mcp_post(server_name):
     """MCP StreamableHTTP POST handler."""
-    config = get_config()
-    if server_name not in config.get('servers', {}):
+    if not _get_server_or_404(server_name):
         return json_response({'error': 'Unknown server'}, 404)
 
     body = request.get_json(force=True)
     session_id = request.headers.get('Mcp-Session-Id')
-
-    if server_name not in sessions:
-        sessions[server_name] = {}
-
     msg_id = body.get('id') if isinstance(body, dict) else None
 
     if not session_id:
@@ -1285,4 +1275,4 @@ def health():
 @app.route('/admin/debug-log')
 @require_dataiku_auth
 def get_debug_log():
-    return json_response(_debug_log)
+    return json_response(list(_debug_log))
