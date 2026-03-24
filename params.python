@@ -36,27 +36,31 @@ PRESET_FIELDS = {'oauth_mode', 'oauth_enabled', 'authorization_server', 'client_
 SERVER_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{0,38}[a-z0-9]$|^[a-z0-9]$')
 
 def _validate_url(url, field_name='URL'):
-    """Validate that a URL is safe (HTTPS only, no private/local targets)."""
+    """Validate that a URL is safe (HTTPS only, no private/local targets).
+    Resolves hostnames to IPs to block DNS rebinding and internal-pointing hostnames."""
     if not url:
         return None  # Empty is fine (field not set)
     from urllib.parse import urlparse
+    import ipaddress
+    import socket
     parsed = urlparse(url)
     if parsed.scheme not in ('https',):
         return f'{field_name} must use HTTPS (got {parsed.scheme}://)'
     host = parsed.hostname or ''
     if not host:
         return f'{field_name} has no hostname'
-    # Block localhost and private IPs
+    # Block localhost literals
     if host in ('localhost', '127.0.0.1', '0.0.0.0', '::1', '[::1]'):
         return f'{field_name} cannot target localhost'
-    # Block private IP ranges
-    import ipaddress
+    # Resolve hostname and check all resulting IPs
     try:
-        ip = ipaddress.ip_address(host)
+        addrinfos = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except socket.gaierror:
+        return f'{field_name} hostname could not be resolved'
+    for family, _, _, _, sockaddr in addrinfos:
+        ip = ipaddress.ip_address(sockaddr[0])
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            return f'{field_name} cannot target private/reserved IP addresses'
-    except ValueError:
-        pass  # It's a hostname, not an IP — that's fine
+            return f'{field_name} resolves to a private/reserved IP address'
     return None
 
 def is_valid_server_name(name):
